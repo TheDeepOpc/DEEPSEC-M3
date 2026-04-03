@@ -10821,6 +10821,10 @@ def intelligent_smart_scan():
             if auto_budget:
                 max_tools = objective_defaults.get(objective, max_tools)
 
+        preflight_decision_reason = objective_decision_reason
+        pre_ai_objective = objective
+        pre_ai_tool_budget = max_tools
+
         autonomous_decision = {
             "enabled": autonomous_mode,
             "objective": objective,
@@ -10829,6 +10833,10 @@ def intelligent_smart_scan():
             "objective_provided_by_operator": objective_provided,
             "auto_budget": auto_budget,
             "tool_budget": max_tools,
+            "decision_source": "deterministic_preflight",
+            "preflight_objective_reason": preflight_decision_reason,
+            "pre_ai_objective": pre_ai_objective,
+            "pre_ai_tool_budget": pre_ai_tool_budget,
         }
 
         live_event_bus.emit(
@@ -10849,8 +10857,8 @@ def intelligent_smart_scan():
         live_event_bus.emit(
             category="ai-thought",
             message=(
-                f"Men avtonom qaror qildim: objective={objective}, budget={max_tools}, "
-                f"mode={'autonomous' if autonomous_mode else 'operator-assisted'}"
+                f"Men preflight heuristika bilan vaqtincha qaror qo'ydim: objective={objective}, budget={max_tools}, "
+                f"mode={'autonomous' if autonomous_mode else 'operator-assisted'}. Endi AI planner buni tekshiradi"
             ),
             trace_id=trace_id,
             data=autonomous_decision,
@@ -10937,14 +10945,53 @@ def intelligent_smart_scan():
                 },
             )
 
+        objective_override_applied = False
+        budget_override_applied = False
         if isinstance(ai_strategy, dict):
             objective_override = ai_strategy.get("objective_override")
             if objective_override in {"comprehensive", "quick", "stealth"}:
+                objective_override_applied = objective_override != objective
                 objective = objective_override
 
             ai_max_tools = ai_strategy.get("max_tools")
             if isinstance(ai_max_tools, int) and ai_max_tools > 0:
-                max_tools = max(1, min(ai_max_tools, 30))
+                adjusted_budget = max(1, min(ai_max_tools, 30))
+                budget_override_applied = adjusted_budget != max_tools
+                max_tools = adjusted_budget
+
+        if strategy_result.get("success") and isinstance(ai_strategy, dict):
+            decision_source = "ai_planner"
+            if objective_override_applied or budget_override_applied:
+                applied_changes: List[str] = []
+                if objective_override_applied:
+                    applied_changes.append(f"objective {pre_ai_objective}->{objective}")
+                if budget_override_applied:
+                    applied_changes.append(f"budget {pre_ai_tool_budget}->{max_tools}")
+                objective_decision_reason = f"AI planner override applied ({', '.join(applied_changes)})"
+            else:
+                objective_decision_reason = "AI planner preflight qarorini tasdiqladi"
+        else:
+            decision_source = "deterministic_fallback"
+            objective_decision_reason = f"Deterministic preflight qarori saqlandi: {preflight_decision_reason}"
+
+        autonomous_decision.update({
+            "objective": objective,
+            "tool_budget": max_tools,
+            "objective_reason": objective_decision_reason,
+            "decision_source": decision_source,
+            "objective_override_applied": objective_override_applied,
+            "budget_override_applied": budget_override_applied,
+        })
+
+        live_event_bus.emit(
+            category="ai-thought",
+            message=(
+                f"Yakuniy qaror manbasi={decision_source}: objective={objective}, budget={max_tools}, "
+                f"mode={'autonomous' if autonomous_mode else 'operator-assisted'}"
+            ),
+            trace_id=trace_id,
+            data=autonomous_decision,
+        )
 
         httpx_status = tool_compatibility_manager.probe_tool("httpx")
         httpx_pd_available = bool(httpx_status.get("ready", False))
@@ -11996,7 +12043,11 @@ def intelligent_smart_scan():
         report_lines.append(f"Trace ID: {trace_id}")
         report_lines.append("")
         report_lines.append("0) DEEPSEC AUTONOMY DECISION")
-        report_lines.append(f"- Objective source: {'DeepSec auto-selected' if objective_auto_selected else 'operator/default'}")
+        report_lines.append(f"- Decision source: {autonomous_decision.get('decision_source', 'deterministic_preflight')}")
+        report_lines.append(
+            f"- Preflight baseline: objective={autonomous_decision.get('pre_ai_objective', objective)}, "
+            f"budget={autonomous_decision.get('pre_ai_tool_budget', max_tools)}"
+        )
         report_lines.append(f"- Objective reason: {objective_decision_reason}")
         report_lines.append(f"- Tool budget: {max_tools} (auto_budget={auto_budget})")
         report_lines.append("")
