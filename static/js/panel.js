@@ -87,36 +87,43 @@ function appendStoryLine(line) {
 
 function resetStory(target, objective, maxTools, traceId) {
   liveStoryLines = [];
-  appendStoryLine("AI PENTEST LIVE STORY");
+  appendStoryLine("DEEPSEC LIVE OPERATION STORY");
   appendStoryLine("");
   appendStoryLine(`Target: ${target}`);
   appendStoryLine(`Objective: ${objective}`);
   appendStoryLine(`Max tools: ${maxTools > 0 ? maxTools : "AUTO"}`);
   appendStoryLine(`Trace ID: ${traceId}`);
   appendStoryLine("");
-  appendStoryLine("AI kuzatuv boshlandi...");
+  appendStoryLine("DeepSec kuzatuv boshlandi...");
 }
 
 function formatLiveEventLine(event) {
   const at = formatEventTime(event.timestamp);
   const tool = event.data?.tool ? ` (${event.data.tool})` : "";
+  const rawMessage = String(event.message || "").trim();
+  const cleanedMessage = rawMessage
+    .replace(/^AI\s*reason:\s*/i, "")
+    .replace(/^AI\s*preflight\s*conclusion:\s*/i, "")
+    .replace(/^AI\s*autonomy\s*decision:\s*/i, "")
+    .replace(/^AI\s*/i, "")
+    .trim();
 
   if (event.category === "ai-thought") {
-    return `[${at}] AI o'yladi${tool}: ${event.message}`;
+    return `[${at}] DeepSec${tool}: ${cleanedMessage || rawMessage}`;
   }
   if (event.category === "tool-start") {
-    return `[${at}] AI bajarishni boshladi${tool}: ${event.message}`;
+    return `[${at}] DeepSec ishga tushirdi${tool}: ${cleanedMessage || rawMessage}`;
   }
   if (event.category === "tool-result") {
-    return `[${at}] Tool natijasi${tool}: ${event.message}`;
+    return `[${at}] DeepSec natija${tool}: ${cleanedMessage || rawMessage}`;
   }
   if (event.category === "scan-error") {
-    return `[${at}] Xatolik: ${event.message}`;
+    return `[${at}] DeepSec xatolik: ${cleanedMessage || rawMessage}`;
   }
   if (event.category === "scan-status") {
-    return `[${at}] Status: ${event.message}`;
+    return `[${at}] DeepSec status: ${cleanedMessage || rawMessage}`;
   }
-  return `[${at}] ${event.message}`;
+  return `[${at}] ${cleanedMessage || rawMessage}`;
 }
 
 async function pollLiveTraceOnce() {
@@ -237,8 +244,8 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
   appendStoryLine("YAKUNIY HISOBOT");
   appendStoryLine(`Nishon: ${target}`);
   appendStoryLine(`Rejim: ${autonomy.enabled === false ? "operator-assisted" : "autonomous"}`);
-  appendStoryLine(`AI tanlagan objective: ${autonomy.objective || "auto"}`);
-  appendStoryLine(`AI budget: ${autonomy.tool_budget || execution.tool_budget || "auto"}`);
+  appendStoryLine(`DeepSec tanlagan objective: ${autonomy.objective || "auto"}`);
+  appendStoryLine(`DeepSec budget: ${autonomy.tool_budget || execution.tool_budget || "auto"}`);
   appendStoryLine(`Bajarilgan toollar: ${execution.successful_tools || 0}/${execution.total_tools || 0}`);
   appendStoryLine(`Topilgan potensial zaifliklar: ${result.scan_results?.total_vulnerabilities || 0}`);
 
@@ -248,7 +255,7 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
 
   if (preflight.target_kind || preflight.web_detected !== undefined) {
     appendStoryLine("");
-    appendStoryLine("AI preflight tahlili:");
+    appendStoryLine("DeepSec preflight tahlili:");
     appendStoryLine(`- target turi: ${preflight.target_kind || "unknown"}`);
     appendStoryLine(`- web detected: ${preflight.web_detected ? "ha" : "yo'q"}`);
     if (Array.isArray(preflight.target_hints) && preflight.target_hints.length > 0) {
@@ -264,7 +271,7 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
 
   if (autonomous.reasoning || autonomousCommands.length > 0) {
     appendStoryLine("");
-    appendStoryLine("AI avtonom tezkor tekshiruvlari:");
+    appendStoryLine("DeepSec avtonom tezkor tekshiruvlari:");
     if (autonomous.reasoning) {
       appendStoryLine(`- reason: ${autonomous.reasoning}`);
     }
@@ -293,7 +300,7 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
 
   if (summary.executive_summary) {
     appendStoryLine("");
-    appendStoryLine(`AI yakuniy xulosa: ${summary.executive_summary}`);
+    appendStoryLine(`DeepSec yakuniy xulosa: ${summary.executive_summary}`);
   }
 
   if (Array.isArray(summary.key_findings) && summary.key_findings.length > 0) {
@@ -306,7 +313,7 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
 
   if (Array.isArray(summary.recommended_next_steps) && summary.recommended_next_steps.length > 0) {
     appendStoryLine("");
-    appendStoryLine("AI keyingi qadamlarni shunday tavsiya qildi:");
+    appendStoryLine("DeepSec keyingi qadamlar tavsiyasi:");
     summary.recommended_next_steps.slice(0, 8).forEach((step, idx) => {
       appendStoryLine(`${idx + 1}. ${step}`);
     });
@@ -322,7 +329,7 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
 
   if (commandReplay.length > 0) {
     appendStoryLine("");
-    appendStoryLine("AI nima ishlatdi:");
+    appendStoryLine("DeepSec ishlatgan toollar va komandalar:");
     commandReplay.forEach((item, idx) => {
       appendStoryLine(`${idx + 1}. ${item.tool || "tool"} -> ${item.status || "unknown"}`);
       appendStoryLine(`   target: ${item.effective_target || "n/a"}`);

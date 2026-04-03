@@ -233,6 +233,356 @@ def build_tool_catalog_for_ai(max_per_category: int = 30) -> Dict[str, Any]:
     }
 
 
+class ToolCompatibilityManager:
+    """Cross-tool CLI compatibility profiler and auto-repair helper."""
+
+    def __init__(self, ttl_seconds: int = 1800) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._tool_probe_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+        self.internal_tools: Set[str] = {
+            "http-framework",
+            "browser-agent",
+            "burpsuite-alternative",
+            "api_fuzzer",
+            "graphql_scanner",
+            "jwt_analyzer",
+            "api_schema_analyzer",
+        }
+
+        self.tool_binary_aliases: Dict[str, List[str]] = {
+            "httpx": ["httpx"],
+            "nmap-advanced": ["nmap"],
+            "enum4linux-ng": ["enum4linux-ng"],
+            "netexec": ["nxc", "netexec"],
+            "zap": ["zaproxy", "zap"],
+            "volatility3": ["volatility3", "vol"],
+            "gdb-peda": ["gdb"],
+            "one-gadget": ["one-gadget", "one_gadget"],
+            "libc-database": ["libc-database", "libcdb"],
+            "docker-bench-security": ["docker-bench-security", "docker-bench"],
+            "scout-suite": ["scout", "scout-suite"],
+            "hakrawler": ["hakrawler"],
+            "x8": ["x8", "x8-tool"],
+        }
+
+        self.flag_aliases: Dict[str, Dict[str, str]] = {
+            "httpx": {
+                "-status-code": "-sc",
+                "--status-code": "-sc",
+                "--silent": "-silent",
+            },
+            "nuclei": {
+                "--rate-limit": "-rl",
+                "--concurrency": "-c",
+            },
+        }
+
+        self.flags_with_values: Set[str] = {
+            "-u", "-l", "-w", "-o", "-p", "-t", "-c", "-rl", "-severity", "-tags", "-timeout",
+            "--url", "--list", "--wordlist", "--output", "--port", "--ports", "--threads", "--timeout",
+            "--severity", "--tags",
+        }
+
+    @staticmethod
+    def _safe_split(segment: str) -> List[str]:
+        try:
+            return shlex.split(segment, posix=False)
+        except Exception:
+            return segment.split()
+
+    @staticmethod
+    def _quote_token(token: str) -> str:
+        text = str(token)
+        if os.name == "nt":
+            if any(ch.isspace() for ch in text) or '"' in text:
+                return '"' + text.replace('"', '""') + '"'
+            return text
+        return shlex.quote(text)
+
+    def _is_cache_valid(self, timestamp: float) -> bool:
+        return (time.time() - timestamp) <= self.ttl_seconds
+
+    def _resolve_binary_candidates(self, tool_name: str) -> List[str]:
+        normalized = str(tool_name or "").strip().lower()
+        candidates: List[str] = []
+
+        if normalized in self.tool_binary_aliases:
+            candidates.extend(self.tool_binary_aliases[normalized])
+
+        candidates.extend([
+            normalized,
+            normalized.replace("-", ""),
+            normalized.replace("-", "_"),
+            normalized.replace("_", "-"),
+            normalized.replace("_", ""),
+        ])
+
+        unique_candidates: List[str] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            clean = str(candidate or "").strip().lower()
+            if not clean or clean in seen:
+                continue
+            if not rex.match(r"^[a-z0-9._-]+$", clean):
+                continue
+            seen.add(clean)
+            unique_candidates.append(clean)
+        return unique_candidates
+
+    def _resolve_binary(self, tool_name: str) -> Optional[str]:
+        for candidate in self._resolve_binary_candidates(tool_name):
+            if shutil.which(candidate):
+                return candidate
+        return None
+
+    def _probe_help_text(self, binary_name: str) -> str:
+        probe_commands = [
+            f"{binary_name} -h",
+            f"{binary_name} --help",
+            f"{binary_name} -help",
+            f"{binary_name} help",
+        ]
+
+        best_output = ""
+        for probe_cmd in probe_commands:
+            try:
+                completed = subprocess.run(
+                    probe_cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+                output_text = f"{completed.stdout or ''}\n{completed.stderr or ''}".strip()
+                if output_text and len(output_text) > len(best_output):
+                    best_output = output_text
+                if completed.returncode == 0 and output_text:
+                    break
+            except Exception:
+                continue
+        return best_output
+
+    def probe_tool(self, tool_name: str) -> Dict[str, Any]:
+        normalized = str(tool_name or "").strip().lower()
+        if not normalized:
+            return {
+                "tool": normalized,
+                "ready": False,
+                "internal": False,
+                "binary": "",
+                "reason": "Empty tool name",
+                "help_excerpt": "",
+            }
+
+        cached = self._tool_probe_cache.get(normalized)
+        if cached and self._is_cache_valid(cached[0]):
+            return dict(cached[1])
+
+        if normalized in self.internal_tools:
+            status = {
+                "tool": normalized,
+                "ready": True,
+                "internal": True,
+                "binary": "internal",
+                "reason": "Internal API tool",
+                "help_excerpt": "",
+            }
+            self._tool_probe_cache[normalized] = (time.time(), dict(status))
+            return status
+
+        binary_name = self._resolve_binary(normalized)
+        if not binary_name:
+            status = {
+                "tool": normalized,
+                "ready": False,
+                "internal": False,
+                "binary": "",
+                "reason": "Binary not found in PATH",
+                "help_excerpt": "",
+            }
+            self._tool_probe_cache[normalized] = (time.time(), dict(status))
+            return status
+
+        help_text = self._probe_help_text(binary_name)
+        help_lower = help_text.lower()
+        reason_text = ""
+        ready = True
+
+        # Special-case known CLI flavor conflicts.
+        if normalized == "httpx":
+            has_pd_flags = ("-tech-detect" in help_lower) and (("-sc" in help_lower) or ("-status-code" in help_lower))
+            if not has_pd_flags:
+                ready = False
+                reason_text = "Detected non-ProjectDiscovery httpx CLI flavor"
+
+        status = {
+            "tool": normalized,
+            "ready": bool(ready),
+            "internal": False,
+            "binary": binary_name,
+            "reason": reason_text,
+            "help_excerpt": (help_text or "")[:240],
+        }
+        self._tool_probe_cache[normalized] = (time.time(), dict(status))
+        return status
+
+    def is_tool_ready(self, tool_name: str) -> Tuple[bool, str, Dict[str, Any]]:
+        status = self.probe_tool(tool_name)
+        if status.get("ready", False):
+            return True, "", status
+        reason = status.get("reason") or "Tool is not runtime-ready"
+        return False, str(reason), status
+
+    @staticmethod
+    def extract_option_error_flags(error_text: str) -> List[str]:
+        text = str(error_text or "")
+        flags: List[str] = []
+
+        patterns = [
+            r"No such option:\s*([\-\w]+)",
+            r"unknown option[:\s]+([\-\w]+)",
+            r"invalid option[:\s]+([\-\w]+)",
+        ]
+        for pattern in patterns:
+            for match in rex.finditer(pattern, text, rex.IGNORECASE):
+                flags.append(match.group(1).strip())
+
+        shorthand_match = rex.search(r"unknown shorthand flag:\s*'([^']+)'", text, rex.IGNORECASE)
+        if shorthand_match:
+            flags.append(f"-{shorthand_match.group(1).strip()}")
+
+        unrecognized_args = rex.search(r"unrecognized arguments?:\s*([^\n\r]+)", text, rex.IGNORECASE)
+        if unrecognized_args:
+            for token in unrecognized_args.group(1).strip().split():
+                if token.startswith("-"):
+                    flags.append(token.strip())
+
+        unique_flags: List[str] = []
+        seen: Set[str] = set()
+        for flag in flags:
+            normalized = str(flag or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_flags.append(normalized)
+        return unique_flags
+
+    def repair_command_from_error(self, command: str, error_text: str) -> Optional[Dict[str, Any]]:
+        bad_flags = self.extract_option_error_flags(error_text)
+        if not bad_flags:
+            return None
+
+        segments = [segment.strip() for segment in str(command or "").split("|")]
+        if not segments:
+            return None
+
+        adjusted_segments: List[str] = []
+        adjustments: List[str] = []
+        changed = False
+
+        for segment in segments:
+            tokens = self._safe_split(segment)
+            if not tokens:
+                adjusted_segments.append(segment)
+                continue
+
+            executable = Path(str(tokens[0])).name.lower()
+            alias_map = self.flag_aliases.get(executable, {})
+            new_tokens: List[str] = [tokens[0]]
+
+            idx = 1
+            while idx < len(tokens):
+                current_token = str(tokens[idx])
+                mapped_token = alias_map.get(current_token, current_token)
+                if mapped_token != current_token:
+                    changed = True
+                    adjustments.append(f"{executable}: replaced {current_token} -> {mapped_token}")
+
+                is_bad_flag = any(
+                    mapped_token == bad_flag or mapped_token.startswith(f"{bad_flag}=")
+                    for bad_flag in bad_flags
+                )
+
+                if is_bad_flag:
+                    changed = True
+                    adjustments.append(f"{executable}: removed unsupported flag {mapped_token}")
+
+                    if (
+                        idx + 1 < len(tokens)
+                        and not str(tokens[idx + 1]).startswith("-")
+                        and mapped_token in self.flags_with_values
+                    ):
+                        idx += 1
+                    idx += 1
+                    continue
+
+                new_tokens.append(mapped_token)
+                idx += 1
+
+            rebuilt_segment = " ".join(self._quote_token(token) for token in new_tokens)
+            adjusted_segments.append(rebuilt_segment)
+
+        if not changed:
+            return None
+
+        repaired_command = " | ".join(adjusted_segments).strip()
+        if not repaired_command or repaired_command == str(command or "").strip():
+            return None
+
+        return {
+            "command": repaired_command,
+            "adjustments": adjustments,
+            "bad_flags": bad_flags,
+        }
+
+    def build_readiness_report(self, tools: Optional[List[str]] = None) -> Dict[str, Any]:
+        if tools is None:
+            snapshot = build_registered_tool_catalog_snapshot()
+            tools = snapshot.get("registered_tools", [])
+
+        normalized_tools = [str(item or "").strip().lower() for item in tools if str(item or "").strip()]
+        unique_tools = sorted(set(normalized_tools))
+
+        records: List[Dict[str, Any]] = []
+        ready_count = 0
+        internal_count = 0
+
+        for tool_name in unique_tools:
+            status = self.probe_tool(tool_name)
+            if status.get("ready"):
+                ready_count += 1
+            if status.get("internal"):
+                internal_count += 1
+            records.append(status)
+
+        not_ready = [item for item in records if not item.get("ready")]
+        target_goal = int(os.environ.get("DEEPSEC_TOOL_GOAL", "150"))
+
+        return {
+            "total_tools": len(unique_tools),
+            "ready_tools": ready_count,
+            "not_ready_tools": len(not_ready),
+            "internal_tools": internal_count,
+            "readiness_score": round((ready_count / len(unique_tools) * 100), 2) if unique_tools else 0.0,
+            "target_goal": target_goal,
+            "goal_gap": max(target_goal - ready_count, 0),
+            "records": records,
+            "top_issues": [
+                {
+                    "tool": item.get("tool"),
+                    "reason": item.get("reason") or "unknown",
+                }
+                for item in not_ready[:30]
+            ],
+        }
+
+
+tool_compatibility_manager = ToolCompatibilityManager(
+    ttl_seconds=int(os.environ.get("DEEPSEC_TOOL_COMPAT_TTL", "1800"))
+)
+
+
 class LiveEventBus:
     """Thread-safe in-memory event stream for frontend live logs and AI traces."""
 
@@ -8886,6 +9236,36 @@ def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
     executor = EnhancedCommandExecutor(command)
     result = executor.execute()
 
+    # Universal option-error recovery pass for httpx-like CLI mismatches.
+    if not result.get("success", False):
+        error_blob = f"{result.get('stderr', '')}\n{result.get('stdout', '')}"
+        repaired = tool_compatibility_manager.repair_command_from_error(command, error_blob)
+
+        if repaired and repaired.get("command"):
+            repaired_command = str(repaired.get("command", "")).strip()
+            if repaired_command and repaired_command != str(command).strip():
+                logger.warning(
+                    f" Compatibility retry engaged | original='{command}' | repaired='{repaired_command}'"
+                )
+
+                retry_executor = EnhancedCommandExecutor(repaired_command)
+                retry_result = retry_executor.execute()
+
+                retry_meta = {
+                    "attempted": True,
+                    "recovered": bool(retry_result.get("success", False)),
+                    "original_command": command,
+                    "repaired_command": repaired_command,
+                    "bad_flags": repaired.get("bad_flags", []),
+                    "adjustments": repaired.get("adjustments", []),
+                }
+
+                if retry_result.get("success", False):
+                    retry_result["compatibility_retry"] = retry_meta
+                    result = retry_result
+                else:
+                    result["compatibility_retry"] = retry_meta
+
     # Cache successful results
     if use_cache and result.get("success", False):
         cache.set(command, {}, result)
@@ -9978,6 +10358,22 @@ def intelligence_tool_catalog():
         logger.error(f" Error building tool catalog: {str(e)}")
         return jsonify({"success": False, "error": f"Server error: {str(e)}"}), 500
 
+
+@app.route("/api/intelligence/tool-readiness", methods=["GET"])
+def intelligence_tool_readiness():
+    """Audit runtime readiness/compatibility for registered tools."""
+    try:
+        snapshot = build_registered_tool_catalog_snapshot()
+        report = tool_compatibility_manager.build_readiness_report(snapshot.get("registered_tools", []))
+        return jsonify({
+            "success": True,
+            "tool_readiness": report,
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        logger.error(f" Error generating tool readiness report: {str(e)}")
+        return jsonify({"success": False, "error": f"Server error: {str(e)}"}), 500
+
 @app.route("/api/intelligence/select-tools", methods=["POST"])
 def select_optimal_tools():
     """Select optimal tools based on target profile and objective"""
@@ -10243,7 +10639,7 @@ def intelligent_smart_scan():
 
         live_event_bus.emit(
             category="scan-status",
-            message=f"AI pentest session started for {target}",
+            message=f"DeepSec session started for {target}",
             trace_id=trace_id,
             data={
                 "target": target,
@@ -10265,7 +10661,7 @@ def intelligent_smart_scan():
 
         live_event_bus.emit(
             category="ai-thought",
-            message=f"AI normalized target. Host: {host_target}, Web: {web_target}",
+            message=f"Men targetni normallashtirdim. Host: {host_target}, Web: {web_target}",
             trace_id=trace_id,
             data={
                 "host_target": host_target,
@@ -10286,6 +10682,14 @@ def intelligent_smart_scan():
         safe_web_token = _shell_quote(web_target)
         safe_web_fuzz_token = _shell_quote(f"{web_target.rstrip('/')}/FUZZ")
 
+        def _short_text(value: Any, limit: int = 220) -> str:
+            """Compact output for human-readable live feed lines."""
+            text = str(value or "")
+            text = rex.sub(r"\s+", " ", text).strip()
+            if len(text) > limit:
+                return text[:limit - 3] + "..."
+            return text
+
         preflight_recon: Dict[str, Any] = {
             "host": host_target,
             "host_without_port": host_no_port,
@@ -10302,7 +10706,7 @@ def intelligent_smart_scan():
 
         live_event_bus.emit(
             category="ai-thought",
-            message="AI reason: avval targetni tez aniqlash uchun DNS/ping/curl/HTTP probe qilaman",
+            message="Men avval targetni tez aniqlash uchun DNS/ping/curl/HTTP probe qilaman",
             trace_id=trace_id,
         )
 
@@ -10413,7 +10817,7 @@ def intelligent_smart_scan():
             else:
                 objective = "quick"
             objective_auto_selected = True
-            objective_decision_reason = f"AI selected objective from preflight target kind: {target_kind}"
+            objective_decision_reason = f"DeepSec selected objective from preflight target kind: {target_kind}"
             if auto_budget:
                 max_tools = objective_defaults.get(objective, max_tools)
 
@@ -10430,7 +10834,7 @@ def intelligent_smart_scan():
         live_event_bus.emit(
             category="ai-thought",
             message=(
-                f"AI preflight conclusion: target looks like {preflight_recon['target_kind']} "
+                f"Men preflightdan keyin targetni {preflight_recon['target_kind']} deb baholadim "
                 f"(hints: {', '.join(preflight_recon['target_hints']) or 'none'})"
             ),
             trace_id=trace_id,
@@ -10445,7 +10849,7 @@ def intelligent_smart_scan():
         live_event_bus.emit(
             category="ai-thought",
             message=(
-                f"AI autonomy decision: objective={objective}, budget={max_tools}, "
+                f"Men avtonom qaror qildim: objective={objective}, budget={max_tools}, "
                 f"mode={'autonomous' if autonomous_mode else 'operator-assisted'}"
             ),
             trace_id=trace_id,
@@ -10496,23 +10900,23 @@ def intelligent_smart_scan():
         planning_warnings = []
         if not strategy_result.get("success"):
             warning_detail = strategy_result.get("error", "Unknown error")
-            planning_warnings.append(f"AI planning unavailable; using deterministic fallback: {warning_detail}")
+            planning_warnings.append(f"DeepSec planning unavailable; using deterministic fallback: {warning_detail}")
             logger.warning(f" Smart scan AI planning fallback engaged: {warning_detail}")
             live_event_bus.emit(
                 category="ai-thought",
-                message="AI planning response failed, switched to deterministic fallback strategy",
+                message="Men planning javobini ololmadim, deterministic fallback strategiyaga o'tdim",
                 trace_id=trace_id,
                 level="warning",
                 data={"reason": warning_detail},
             )
 
         if strategy_result.get("parse_error"):
-            parse_warning = strategy_result.get("warning", "AI JSON parse fallback applied")
+            parse_warning = strategy_result.get("warning", "DeepSec JSON parse fallback applied")
             planning_warnings.append(parse_warning)
             logger.warning(f" Smart scan parse fallback: {parse_warning}")
             live_event_bus.emit(
                 category="ai-thought",
-                message="AI planning JSON format was broken, repaired with parser fallback",
+                message="Planning JSON formati buzilgan edi, parser fallback bilan tuzatdim",
                 trace_id=trace_id,
                 level="warning",
                 data={"warning": parse_warning},
@@ -10523,7 +10927,7 @@ def intelligent_smart_scan():
         if isinstance(ai_strategy, dict) and ai_strategy:
             live_event_bus.emit(
                 category="ai-thought",
-                message="AI created an execution strategy based on objective and tool catalog",
+                message="Men objective va tool katalog asosida execution strategiya tuzdim",
                 trace_id=trace_id,
                 data={
                     "objective_override": ai_strategy.get("objective_override"),
@@ -10542,59 +10946,32 @@ def intelligent_smart_scan():
             if isinstance(ai_max_tools, int) and ai_max_tools > 0:
                 max_tools = max(1, min(ai_max_tools, 30))
 
+        httpx_status = tool_compatibility_manager.probe_tool("httpx")
+        httpx_pd_available = bool(httpx_status.get("ready", False))
+        httpx_pd_reason = str(httpx_status.get("reason", "") or "")
+        if not httpx_pd_available:
+            planning_warnings.append(f"httpx skipped: {httpx_pd_reason}")
+
         def _tool_runtime_available(tool_name: str) -> bool:
-            """Best-effort runtime availability check for /api/tools endpoints."""
-            internal_api_tools = {
-                "http-framework",
-                "browser-agent",
-                "burpsuite-alternative",
-                "api_fuzzer",
-                "graphql_scanner",
-                "jwt_analyzer",
-                "api_schema_analyzer",
-            }
-            if tool_name in internal_api_tools:
-                return True
-
-            binary_aliases = {
-                "zap": ["zaproxy", "zap"],
-                "netexec": ["nxc", "netexec"],
-                "nmap-advanced": ["nmap"],
-                "enum4linux-ng": ["enum4linux-ng"],
-                "scout-suite": ["scout", "scout-suite"],
-                "docker-bench-security": ["docker-bench-security", "docker-bench"],
-                "volatility3": ["volatility3", "vol"],
-                "gdb-peda": ["gdb"],
-                "one-gadget": ["one-gadget", "one_gadget"],
-                "libc-database": ["libc-database", "libcdb"],
-            }
-
-            candidates: List[str] = []
-            if tool_name in binary_aliases:
-                candidates.extend(binary_aliases[tool_name])
-
-            normalized = tool_name.lower()
-            candidates.append(normalized)
-            if "-" in normalized:
-                candidates.append(normalized.replace("-", ""))
-                candidates.append(normalized.replace("-", "_"))
-            if "_" in normalized:
-                candidates.append(normalized.replace("_", ""))
-                candidates.append(normalized.replace("_", "-"))
-
-            seen: Set[str] = set()
-            for candidate in candidates:
-                if not candidate or candidate in seen:
-                    continue
-                seen.add(candidate)
-                if shutil.which(candidate):
-                    return True
-
-            return False
+            """Runtime readiness check based on centralized compatibility profiling."""
+            ready, _, _ = tool_compatibility_manager.is_tool_ready(tool_name)
+            return bool(ready)
 
         registered_tool_catalog = build_registered_tool_catalog_snapshot()
         registered_api_tools = registered_tool_catalog.get("registered_tools", [])
-        runtime_available_tools = [tool for tool in registered_api_tools if _tool_runtime_available(tool)]
+        runtime_available_tools: List[str] = []
+        runtime_blocked_tools: List[Dict[str, str]] = []
+
+        for tool_name in registered_api_tools:
+            ready, reason, status = tool_compatibility_manager.is_tool_ready(tool_name)
+            if ready:
+                runtime_available_tools.append(tool_name)
+            else:
+                runtime_blocked_tools.append({
+                    "tool": tool_name,
+                    "reason": str(reason or "not runtime-ready"),
+                    "binary": str(status.get("binary", "") or ""),
+                })
 
         if not runtime_available_tools:
             runtime_available_tools = [
@@ -10603,16 +10980,24 @@ def intelligent_smart_scan():
             ]
             planning_warnings.append("Runtime tool availability check returned empty; fallback baseline set applied")
 
+        if runtime_blocked_tools:
+            planning_warnings.append(
+                f"{len(runtime_blocked_tools)} tools blocked by runtime compatibility checks"
+            )
+            for blocked in runtime_blocked_tools[:8]:
+                planning_warnings.append(f"{blocked['tool']}: {blocked['reason']}")
+
         live_event_bus.emit(
             category="scan-status",
             message=(
-                f"AI loaded tool inventory: {len(registered_api_tools)} registered, "
+                f"DeepSec tool inventory: {len(registered_api_tools)} registered, "
                 f"{len(runtime_available_tools)} runtime-available"
             ),
             trace_id=trace_id,
             data={
                 "registered_tools": len(registered_api_tools),
                 "runtime_available_tools": len(runtime_available_tools),
+                "runtime_blocked_tools": len(runtime_blocked_tools),
             },
         )
 
@@ -10679,11 +11064,11 @@ def intelligent_smart_scan():
                 "command": f"curl -I -m 6 -sS {safe_web_token}",
                 "purpose": "Confirm live HTTP headers and quick response profile",
             })
-            if shutil.which("httpx"):
+            if httpx_pd_available:
                 autonomous_step_templates.append({
                     "id": "httpx_fingerprint",
                     "name": "Fast HTTP fingerprint",
-                    "command": f"echo {safe_host_token} | httpx -silent -title -status-code -tech-detect -follow-redirects -timeout 5",
+                    "command": f"httpx -u {safe_web_token} -silent -title -sc -tech-detect -follow-redirects -timeout 5",
                     "purpose": "Get fast app fingerprinting signals",
                 })
             if shutil.which("katana"):
@@ -10789,7 +11174,7 @@ def intelligent_smart_scan():
             if ai_autonomous_recon["reasoning"]:
                 live_event_bus.emit(
                     category="ai-thought",
-                    message=f"AI autonomous recon plan: {ai_autonomous_recon['reasoning']}",
+                    message=f"Men avtonom recon reja tuzdim: {ai_autonomous_recon['reasoning']}",
                     trace_id=trace_id,
                     data={"planned_steps": ai_autonomous_recon["planned_steps"]},
                 )
@@ -10797,7 +11182,7 @@ def intelligent_smart_scan():
             for step in planned_steps:
                 live_event_bus.emit(
                     category="scan-status",
-                    message=f"AI quick check -> {step['name']}",
+                    message=f"DeepSec quick check -> {step['name']}",
                     trace_id=trace_id,
                     data={"step": step["id"], "command": step["command"]},
                 )
@@ -10823,8 +11208,8 @@ def intelligent_smart_scan():
                 live_event_bus.emit(
                     category="ai-thought",
                     message=(
-                        f"AI quick check result ({step['id']}): "
-                        f"{'success' if cmd_success else 'failed'}"
+                        f"Men quick check ({step['id']}) ni {'muvaffaqiyatli' if cmd_success else 'muvaffaqiyatsiz'} tugatdim. "
+                        f"Natija: {_short_text(stdout_text or stderr_text, 240) or 'chiqish yoq'}"
                     ),
                     trace_id=trace_id,
                     level="info" if cmd_success else "warning",
@@ -10846,7 +11231,7 @@ def intelligent_smart_scan():
         live_event_bus.emit(
             category="scan-status",
             message=(
-                f"AI phase-1 selected {len(initial_tools)} tools. "
+                f"DeepSec phase-1 uchun {len(initial_tools)} tool tanladi. "
                 f"Total scan budget: {max_tools} tools"
             ),
             trace_id=trace_id,
@@ -10875,11 +11260,67 @@ def intelligent_smart_scan():
             "execution_summary": {},
             "combined_output": ""
         }
+        tool_compatibility_warnings: Set[str] = set()
+
+        def _tool_goal(tool_name: str) -> str:
+            goals = {
+                "nmap": "port va servislarni aniqlash",
+                "nuclei": "known template asosida zaifliklarni topish",
+                "httpx": "HTTP fingerprint va statuslarni yig'ish",
+                "katana": "endpoint crawl qilish",
+                "ffuf": "yashirin path va endpointlarni fuzz qilish",
+                "dirsearch": "directory/file discovery",
+                "sqlmap": "SQL injection signalini tekshirish",
+                "dalfox": "XSS yuzalarini tekshirish",
+                "amass": "subdomain topish",
+                "subfinder": "passive subdomain enumeration",
+            }
+            return goals.get(tool_name, "target sirtini kengroq tekshirish")
+
+        def _detect_cli_mismatch(tool_name: str, stdout_text: str, stderr_text: str) -> str:
+            combined = f"{stdout_text}\n{stderr_text}".strip()
+            lower = combined.lower()
+
+            mismatch_markers = [
+                "no such option",
+                "unknown option",
+                "unrecognized argument",
+                "unrecognized arguments",
+                "invalid option",
+                "unknown shorthand flag",
+            ]
+            if any(marker in lower for marker in mismatch_markers):
+                option_match = rex.search(
+                    r"(?:no such option|unknown option|unrecognized arguments?|invalid option)[:\s]+([\-\w]+)",
+                    combined,
+                    rex.IGNORECASE,
+                )
+                option_text = option_match.group(1) if option_match else "flag"
+                return (
+                    f"CLI mos emas ({option_text}); {tool_name} versiyasi/forki kutilgan flaglarni qo'llamayapti. "
+                    f"To'g'ri build yoki mos flag kerak"
+                )
+
+            if "is not recognized as an internal or external command" in lower or "command not found" in lower:
+                return f"{tool_name} PATH da topilmadi yoki ishga tushmadi"
+
+            return ""
 
         def execute_tool_via_api_endpoint(tool_name: str, effective_target: str, optimized_params: Dict[str, Any]) -> Dict[str, Any]:
             """Execute any registered /api/tools/<tool> endpoint with adaptive payload defaults."""
             endpoint_path = f"/api/tools/{tool_name}"
             payload = dict(optimized_params or {})
+
+            tool_ready, tool_reason, tool_status = tool_compatibility_manager.is_tool_ready(tool_name)
+            if not tool_ready:
+                return {
+                    "success": False,
+                    "error": f"{tool_name} not runtime-ready: {tool_reason}",
+                    "stdout": "",
+                    "stderr": str(tool_reason),
+                    "command": str(tool_status.get("binary", "") or ""),
+                    "execution_time": 0,
+                }
 
             payload.setdefault("target", effective_target)
             payload.setdefault("url", web_target)
@@ -10989,12 +11430,6 @@ def intelligent_smart_scan():
             """Execute a single tool and return results"""
             try:
                 logger.info(f" Executing {tool_name} with optimized parameters")
-                live_event_bus.emit(
-                    category="tool-start",
-                    message=f"AI decided to run {tool_name}",
-                    trace_id=trace_id,
-                    data={"tool": tool_name},
-                )
 
                 # Get optimized parameters for this tool
                 optimized_params = recon_planner.optimize_parameters(tool_name, profile)
@@ -11016,6 +11451,26 @@ def intelligent_smart_scan():
                 if tool_name in network_tools and port_hint and not optimized_params.get("ports"):
                     optimized_params = dict(optimized_params)
                     optimized_params["ports"] = str(port_hint)
+
+                parameter_preview = ", ".join(
+                    [f"{key}={value}" for key, value in list((optimized_params or {}).items())[:4]]
+                ) or "default"
+                goal_text = _tool_goal(tool_name)
+
+                live_event_bus.emit(
+                    category="tool-start",
+                    message=(
+                        f"Men {tool_name} ni ishga tushiraman: maqsad={goal_text}, "
+                        f"target={effective_target}, params={parameter_preview}"
+                    ),
+                    trace_id=trace_id,
+                    data={
+                        "tool": tool_name,
+                        "effective_target": effective_target,
+                        "goal": goal_text,
+                        "parameter_preview": parameter_preview,
+                    },
+                )
 
                 # Map tool names to their actual execution functions
                 tool_execution_map = {
@@ -11116,11 +11571,37 @@ def intelligent_smart_scan():
 
                 command_text = result.get('command', '') or ''
 
-                completion_message = f"{tool_name} completed with status: {'success' if tool_success else 'failed'}"
+                compatibility_hint = _detect_cli_mismatch(tool_name, stdout_text, stderr_text)
+                if compatibility_hint and compatibility_hint not in failure_reason:
+                    failure_reason = (
+                        f"{failure_reason}; {compatibility_hint}"
+                        if failure_reason else compatibility_hint
+                    )
+
+                if compatibility_hint and tool_name not in tool_compatibility_warnings:
+                    tool_compatibility_warnings.add(tool_name)
+                    planning_warnings.append(f"{tool_name}: {compatibility_hint}")
+                    live_event_bus.emit(
+                        category="scan-status",
+                        message=f"DeepSec compatibility warning ({tool_name}): {compatibility_hint}",
+                        trace_id=trace_id,
+                        level="warning",
+                        data={"tool": tool_name, "warning": compatibility_hint},
+                    )
+
+                result_excerpt = _short_text(stdout_text or stderr_text, 260)
                 if tool_success:
-                    completion_message += f"; findings flagged: {vuln_count}"
-                elif failure_reason:
-                    completion_message += f"; reason: {failure_reason}"
+                    completion_message = (
+                        f"Men {tool_name} ni muvaffaqiyatli tugatdim. "
+                        f"Topilgan signal: {vuln_count}. "
+                        f"Chiqish: {result_excerpt or 'muhim chiqish yoq'}"
+                    )
+                else:
+                    completion_message = (
+                        f"Men {tool_name} ni tugata olmadim. "
+                        f"Sabab: {failure_reason or 'noma\'lum xato'}. "
+                        f"Chiqish: {result_excerpt or 'chiqish yoq'}"
+                    )
 
                 live_event_bus.emit(
                     category="tool-result",
@@ -11133,6 +11614,22 @@ def intelligent_smart_scan():
                         "command": command_text,
                         "vulnerabilities_found": vuln_count,
                         "error": failure_reason,
+                        "result_excerpt": result_excerpt,
+                    },
+                )
+
+                live_event_bus.emit(
+                    category="ai-thought",
+                    message=(
+                        f"Men {tool_name} natijasini tahlil qildim: "
+                        f"{'zaiflik signal topildi' if vuln_count else 'katta signal topilmadi' if tool_success else 'tool muvaffaqiyatsiz bo\'ldi'}"
+                    ),
+                    trace_id=trace_id,
+                    level="info" if tool_success else "warning",
+                    data={
+                        "tool": tool_name,
+                        "vulnerabilities_found": vuln_count,
+                        "result_excerpt": result_excerpt,
                     },
                 )
 
@@ -11197,7 +11694,7 @@ def intelligent_smart_scan():
                     live_event_bus.emit(
                         category="scan-status",
                         message=(
-                            f"Progress {completed_count}/{max_tools}: "
+                            f"DeepSec progress {completed_count}/{max_tools}: "
                             f"{tool_result.get('tool', 'tool')} -> {tool_result.get('status', 'unknown')}"
                         ),
                         trace_id=trace_id,
@@ -11217,7 +11714,7 @@ def intelligent_smart_scan():
         executed_tool_names.update(phase1_tools)
         adaptive_phase_notes.append({
             "phase": "phase-1",
-            "reason": "Initial AI planning batch",
+            "reason": "Initial DeepSec planning batch",
             "tools": phase1_tools,
         })
 
@@ -11281,7 +11778,7 @@ def intelligent_smart_scan():
                     planning_warnings.append(warning_text)
                     live_event_bus.emit(
                         category="ai-thought",
-                        message=warning_text,
+                        message=f"Men follow-up planningda xato oldim, heuristic davom ettiraman: {warning_text}",
                         trace_id=trace_id,
                         level="warning",
                     )
@@ -11291,7 +11788,7 @@ def intelligent_smart_scan():
                     planning_warnings.append(warning_text)
                     live_event_bus.emit(
                         category="ai-thought",
-                        message=warning_text,
+                        message=f"Men follow-up parse fallback ishlatdim: {warning_text}",
                         trace_id=trace_id,
                         level="warning",
                     )
@@ -11305,12 +11802,12 @@ def intelligent_smart_scan():
                     ]
                     phase_tools = list(dict.fromkeys(phase_tools))
 
-                phase_reason = str(followup_plan.get("reasoning", "AI selected adaptive follow-up tools")) if isinstance(followup_plan, dict) else "AI selected adaptive follow-up tools"
+                phase_reason = str(followup_plan.get("reasoning", "DeepSec selected adaptive follow-up tools")) if isinstance(followup_plan, dict) else "DeepSec selected adaptive follow-up tools"
                 should_stop = bool(followup_plan.get("stop", False)) if isinstance(followup_plan, dict) else False
                 if should_stop and not phase_tools:
                     live_event_bus.emit(
                         category="ai-thought",
-                        message="AI decided current evidence is sufficient and stopped additional phases",
+                        message="Men hozirgi evidenceni yetarli deb topdim va qo'shimcha fazalarni to'xtatdim",
                         trace_id=trace_id,
                     )
                     break
@@ -11322,7 +11819,7 @@ def intelligent_smart_scan():
                         "amass", "gobuster", "feroxbuster", "wpscan"
                     ]
                     phase_tools = [tool for tool in heuristic_priority if tool in followup_candidates][:min(remaining_budget, 4)]
-                    phase_reason = "Heuristic follow-up (AI follow-up returned no concrete tools)"
+                    phase_reason = "Heuristic follow-up (DeepSec follow-up returned no concrete tools)"
 
             phase_tools = [tool for tool in phase_tools if tool not in executed_tool_names]
             phase_tools = phase_tools[:min(remaining_budget, 5)]
@@ -11331,7 +11828,7 @@ def intelligent_smart_scan():
 
             live_event_bus.emit(
                 category="ai-thought",
-                message=f"AI decided {len(phase_tools)} tools for phase-{phase_index}: {', '.join(phase_tools)}",
+                message=f"Men phase-{phase_index} uchun {len(phase_tools)} tool tanladim: {', '.join(phase_tools)}",
                 trace_id=trace_id,
                 data={"phase": f"phase-{phase_index}", "reason": phase_reason, "tools": phase_tools},
             )
@@ -11440,7 +11937,7 @@ def intelligent_smart_scan():
 
         ai_summary_runtime = build_ai_runtime_metadata("smart-scan-summary", ai_summary_result)
         if ai_summary_result.get("parse_error"):
-            planning_warnings.append(ai_summary_result.get("warning", "AI summary parse fallback applied"))
+            planning_warnings.append(ai_summary_result.get("warning", "DeepSec summary parse fallback applied"))
 
         if ai_summary_result.get("success") and isinstance(ai_summary_result.get("json"), dict):
             ai_scan_summary = ai_summary_result.get("json", {})
@@ -11448,13 +11945,13 @@ def intelligent_smart_scan():
             if executive_summary:
                 live_event_bus.emit(
                     category="ai-thought",
-                    message=f"AI final interpretation: {executive_summary}",
+                    message=f"Yakuniy xulosam: {executive_summary}",
                     trace_id=trace_id,
                     data={"summary": executive_summary},
                 )
         else:
             planning_warnings.append(
-                f"AI summary unavailable; fallback summary used: {ai_summary_result.get('error', 'unknown error')}"
+                f"DeepSec summary unavailable; fallback summary used: {ai_summary_result.get('error', 'unknown error')}"
             )
             ai_scan_summary = {
                 "executive_summary": (
@@ -11478,13 +11975,13 @@ def intelligent_smart_scan():
                     "Replay failed commands manually from command_replay for diagnostics.",
                 ],
                 "operator_notes": [
-                    "Summary generated using deterministic fallback due AI summary issue."
+                    "Summary generated using deterministic fallback due DeepSec summary issue."
                 ],
             }
 
             live_event_bus.emit(
                 category="ai-thought",
-                message="AI summary step failed, using deterministic fallback summary",
+                message="Summary bosqichi muvaffaqiyatsiz bo'ldi, deterministic fallback summary ishlatdim",
                 trace_id=trace_id,
                 level="warning",
                 data={"error": ai_summary_result.get("error", "unknown error")},
@@ -11498,12 +11995,12 @@ def intelligent_smart_scan():
         report_lines.append(f"Objective: {objective}")
         report_lines.append(f"Trace ID: {trace_id}")
         report_lines.append("")
-        report_lines.append("0) AI AUTONOMY DECISION")
-        report_lines.append(f"- Objective source: {'AI auto-selected' if objective_auto_selected else 'operator/default'}")
+        report_lines.append("0) DEEPSEC AUTONOMY DECISION")
+        report_lines.append(f"- Objective source: {'DeepSec auto-selected' if objective_auto_selected else 'operator/default'}")
         report_lines.append(f"- Objective reason: {objective_decision_reason}")
         report_lines.append(f"- Tool budget: {max_tools} (auto_budget={auto_budget})")
         report_lines.append("")
-        report_lines.append("1) AI PRE-FLIGHT REASONING")
+        report_lines.append("1) DEEPSEC PRE-FLIGHT REASONING")
         report_lines.append(f"- Target kind: {preflight_recon.get('target_kind', 'unknown')}")
         report_lines.append(f"- Hints: {', '.join(preflight_recon.get('target_hints', [])) or 'none'}")
         if preflight_recon.get("http_probe", {}).get("success"):
@@ -11516,9 +12013,9 @@ def intelligent_smart_scan():
             report_lines.append("- HTTP probe failed or target not reachable over web")
 
         report_lines.append("")
-        report_lines.append("2) AI AUTONOMOUS QUICK CHECKS")
+        report_lines.append("2) DEEPSEC AUTONOMOUS QUICK CHECKS")
         if ai_autonomous_recon.get("reasoning"):
-            report_lines.append(f"- AI reasoning: {ai_autonomous_recon.get('reasoning')}")
+            report_lines.append(f"- DeepSec reasoning: {ai_autonomous_recon.get('reasoning')}")
         for idx, item in enumerate(ai_autonomous_recon.get("executed_commands", []), start=1):
             report_lines.append(
                 f"- [{idx}] {item.get('step_id', 'step')} -> {item.get('status', 'unknown')} | {item.get('command', '')}"
@@ -11543,7 +12040,7 @@ def intelligent_smart_scan():
             )
 
         report_lines.append("")
-        report_lines.append("4) AI EXECUTIVE SUMMARY")
+        report_lines.append("4) DEEPSEC EXECUTIVE SUMMARY")
         report_lines.append(f"- {ai_scan_summary.get('executive_summary', 'No executive summary')}")
         for finding in ai_scan_summary.get("key_findings", [])[:10]:
             report_lines.append(f"- finding: {finding}")
@@ -11572,7 +12069,7 @@ def intelligent_smart_scan():
         live_event_bus.emit(
             category="scan-status",
             message=(
-                f"AI pentest completed: {len(successful_tools)}/{total_executed_tools} tools succeeded, "
+                f"DeepSec pentest completed: {len(successful_tools)}/{total_executed_tools} tools succeeded, "
                 f"{scan_results['total_vulnerabilities']} potential findings"
             ),
             trace_id=trace_id,
@@ -11732,12 +12229,47 @@ def execute_katana_scan(target, params):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
+def detect_projectdiscovery_httpx():
+    """Return whether ProjectDiscovery httpx is available in PATH."""
+    httpx_path = shutil.which("httpx")
+    if not httpx_path:
+        return False, "httpx binary not found in PATH"
+
+    try:
+        help_result = execute_command("httpx -h", use_cache=True)
+        help_text = f"{help_result.get('stdout', '')}\n{help_result.get('stderr', '')}".lower()
+    except Exception as e:
+        return False, f"httpx help probe failed: {str(e)}"
+
+    if "-tech-detect" in help_text and "-sc" in help_text:
+        return True, ""
+
+    if "next generation http client" in help_text or "python" in help_text and "usage" in help_text:
+        return False, "Detected non-ProjectDiscovery httpx CLI in PATH; install projectdiscovery/httpx"
+
+    return False, "Installed httpx does not expose ProjectDiscovery flags (-tech-detect/-sc)"
+
 def execute_httpx_scan(target, params):
     """Execute httpx scan with optimized parameters"""
     try:
-        additional_args = params.get('additional_args', '-tech-detect -status-code')
-        # Use shell command with pipe for httpx
-        cmd = f"echo {target} | httpx {additional_args}"
+        httpx_ok, httpx_reason = detect_projectdiscovery_httpx()
+        if not httpx_ok:
+            return {
+                "success": False,
+                "error": httpx_reason,
+                "command": "httpx -h",
+            }
+
+        additional_args = str(params.get('additional_args', '') or '').strip()
+        if not additional_args:
+            additional_args = "-tech-detect -sc -title"
+
+        # Normalize old/incorrect long flag to ProjectDiscovery short flag.
+        additional_args = additional_args.replace("-status-code", "-sc")
+
+        target_token = shlex.quote(str(target))
+        cmd = f"httpx -u {target_token} {additional_args}".strip()
 
         return execute_command(cmd)
     except Exception as e:
@@ -14975,7 +15507,12 @@ def httpx():
             logger.warning(" httpx called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"httpx -l {target} -t {threads}"
+        httpx_ok, httpx_reason = detect_projectdiscovery_httpx()
+        if not httpx_ok:
+            logger.warning(f" httpx endpoint unavailable: {httpx_reason}")
+            return jsonify({"success": False, "error": httpx_reason}), 400
+
+        command = f"httpx -u {target} -t {threads}"
 
         if probe:
             command += " -probe"
