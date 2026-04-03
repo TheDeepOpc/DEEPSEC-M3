@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepSec Control Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Sans:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/panel.css" />
+</head>
+<body>
+  <div class="ambient-grid" aria-hidden="true"></div>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">DeepSec</p>
+      <h1>Operations Web Panel</h1>
+      <p class="subline">Unified AI runtime powered by Ollama model minmax2.5:cloud</p>
+    </div>
+    <div class="status-cluster">
+      <div class="status-card" id="control-plane-status">Control Plane: checking...</div>
+      <div class="status-card" id="ollama-status">Ollama: checking...</div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel chat-panel">
+      <h2>AI Command Console</h2>
+      <div id="chat-log" class="chat-log" aria-live="polite"></div>
+      <form id="chat-form" class="stack">
+        <label for="chat-message">Operator Prompt</label>
+        <textarea id="chat-message" rows="4" placeholder="Describe your security objective..." required></textarea>
+        <button type="submit">Send To Ollama</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Target Intelligence</h2>
+      <form id="analyze-form" class="stack">
+        <label for="analyze-target">Target</label>
+        <input id="analyze-target" placeholder="https://target.tld" required />
+        <button type="submit">Analyze Target</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Smart Scan</h2>
+      <form id="scan-form" class="stack">
+        <label for="scan-target">Target</label>
+        <input id="scan-target" placeholder="https://target.tld" required />
+        <label for="scan-objective">Objective</label>
+        <select id="scan-objective">
+          <option value="comprehensive">Comprehensive</option>
+          <option value="quick">Quick</option>
+          <option value="stealth">Stealth</option>
+        </select>
+        <label for="scan-max-tools">Max tools</label>
+        <input id="scan-max-tools" type="number" min="1" max="10" value="5" />
+        <button type="submit">Run AI Smart Scan</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Payload Lab</h2>
+      <form id="payload-form" class="stack">
+        <label for="payload-attack-type">Attack type</label>
+        <select id="payload-attack-type">
+          <option value="xss">xss</option>
+          <option value="sqli">sqli</option>
+          <option value="lfi">lfi</option>
+          <option value="cmd_injection">cmd_injection</option>
+          <option value="ssti">ssti</option>
+          <option value="xxe">xxe</option>
+        </select>
+        <label for="payload-complexity">Complexity</label>
+        <select id="payload-complexity">
+          <option value="basic">basic</option>
+          <option value="advanced">advanced</option>
+          <option value="bypass">bypass</option>
+        </select>
+        <label for="payload-technology">Technology context</label>
+        <input id="payload-technology" placeholder="php, nodejs, django" />
+        <button type="submit">Generate AI Payloads</button>
+      </form>
+    </section>
+
+    <section class="panel full-width">
+      <h2>Operation Output</h2>
+      <pre id="output" class="output">Ready.</pre>
+    </section>
+  </main>
+
+  <script src="/static/js/panel.js"></script>
+</body>
+</html>
