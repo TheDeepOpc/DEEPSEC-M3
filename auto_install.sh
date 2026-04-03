@@ -6,7 +6,7 @@ VENV_DIR="${PROJECT_DIR}/deepsec_env"
 
 WITH_TOOLS=0
 INSTALL_OLLAMA=0
-OLLAMA_MODEL="${DEEPSEC_OLLAMA_MODEL:-minmax2.5:cloud}"
+OLLAMA_MODEL="${DEEPSEC_OLLAMA_MODEL:-minimax-m2.5:cloud}"
 
 log() {
   printf '[INFO] %s\n' "$1"
@@ -30,13 +30,13 @@ Usage:
 Options:
   --with-tools                    Install core external security tool packages (APT-based systems)
   --install-ollama                Install Ollama if missing and pull model
-  --ollama-model <model>          Ollama model to pull (default: minmax2.5:cloud)
+  --ollama-model <model>          Ollama model to pull (default: minimax-m2.5:cloud)
   -h, --help                      Show this help message
 
 Examples:
   ./auto_install.sh
   ./auto_install.sh --with-tools
-  ./auto_install.sh --install-ollama --ollama-model minmax2.5:cloud
+  ./auto_install.sh --install-ollama --ollama-model minimax-m2.5:cloud
 EOF
 }
 

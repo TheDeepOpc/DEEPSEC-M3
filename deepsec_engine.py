@@ -112,7 +112,7 @@ API_HOST = os.environ.get('DEEPSEC_HOST', '127.0.0.1')
 
 # AI Runtime Configuration (Ollama)
 OLLAMA_BASE_URL = os.environ.get('DEEPSEC_OLLAMA_URL', 'http://127.0.0.1:11434')
-OLLAMA_MODEL = os.environ.get('DEEPSEC_OLLAMA_MODEL', 'minmax2.5:cloud')
+OLLAMA_MODEL = os.environ.get('DEEPSEC_OLLAMA_MODEL', 'minimax-m2.5:cloud')
 OLLAMA_TIMEOUT = int(os.environ.get('DEEPSEC_OLLAMA_TIMEOUT', '180'))
 AI_ENFORCE_OLLAMA = os.environ.get('DEEPSEC_AI_ENFORCE_OLLAMA', 'true').lower() in ('1', 'true', 'yes', 'on')
 
@@ -9071,16 +9071,28 @@ def web_panel_home():
 def ai_runtime_health():
     """Health endpoint for the centralized Ollama runtime."""
     runtime = ollama_runtime.health()
+    runtime_success = bool(runtime.get("success", False))
+    model_ready = bool(runtime.get("model_ready", False))
+
+    # If Ollama enforcement is enabled, the configured model must be available.
+    ai_ready = runtime_success and (model_ready or not AI_ENFORCE_OLLAMA)
+
     response = {
-        "success": runtime.get("success", False),
+        "success": ai_ready,
         "model": OLLAMA_MODEL,
+        "model_ready": model_ready,
         "base_url": OLLAMA_BASE_URL,
         "enforced": AI_ENFORCE_OLLAMA,
         "ollama": runtime,
         "timestamp": datetime.now().isoformat(),
     }
 
-    if not runtime.get("success"):
+    if not ai_ready:
+        if runtime_success and not model_ready:
+            response["error"] = f"Configured model '{OLLAMA_MODEL}' is not available in Ollama"
+        elif not runtime_success:
+            response["error"] = runtime.get("error", "Ollama runtime is unavailable")
+
         status_code = 503 if AI_ENFORCE_OLLAMA else 200
         return jsonify(response), status_code
 
@@ -9242,6 +9254,7 @@ def health_check():
     }
 
     return jsonify({
+        "success": True,
         "status": "healthy",
         "message": "DeepSec AI Tools API Server is operational",
         "version": "6.0.0",

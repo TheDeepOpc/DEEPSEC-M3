@@ -30,7 +30,8 @@ async function apiPost(url, payload) {
 
   const data = await res.json().catch(() => ({ success: false, error: "Invalid JSON response" }));
   if (!res.ok || data.success === false) {
-    const message = data.error || `Request failed with status ${res.status}`;
+    const detail = data.details ? `: ${data.details}` : "";
+    const message = `${data.error || `Request failed with status ${res.status}`}${detail}`;
     throw new Error(message);
   }
   return data;
@@ -46,8 +47,23 @@ async function refreshStatus() {
     const health = await healthRes.json();
     const aiHealth = await aiHealthRes.json();
 
-    setStatus("control-plane-status", "Control Plane", !!health.success, health.version || "runtime");
-    setStatus("ollama-status", "Ollama", !!aiHealth.success && !!aiHealth.ollama?.success, aiHealth.model || "minmax2.5:cloud");
+    const controlPlaneOnline = health.success === true || health.status === "healthy";
+    const ollamaReachable = !!aiHealth.ollama?.success;
+    const modelReady = !!aiHealth.ollama?.model_ready;
+    const ollamaOnline = !!aiHealth.success && ollamaReachable && modelReady;
+
+    let ollamaDetail = aiHealth.model || "minimax-m2.5:cloud";
+    if (ollamaReachable && !modelReady) {
+      const availableModels = aiHealth.ollama?.available_models || [];
+      if (Array.isArray(availableModels) && availableModels.length > 0) {
+        ollamaDetail = `model not ready, available: ${availableModels.slice(0, 3).join(", ")}`;
+      } else {
+        ollamaDetail = "model not ready";
+      }
+    }
+
+    setStatus("control-plane-status", "Control Plane", controlPlaneOnline, health.version || "runtime");
+    setStatus("ollama-status", "Ollama", ollamaOnline, ollamaDetail);
   } catch (err) {
     setStatus("control-plane-status", "Control Plane", false, "unreachable");
     setStatus("ollama-status", "Ollama", false, "unreachable");

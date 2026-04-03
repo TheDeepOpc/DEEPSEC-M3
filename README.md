@@ -70,7 +70,7 @@ chmod +x auto_install.sh
 ### 4) Ollama install/pull bilan
 
 ```bash
-./auto_install.sh --install-ollama --ollama-model minmax2.5:cloud
+./auto_install.sh --install-ollama --ollama-model minimax-m2.5:cloud
 ```
 
 Skript nima qiladi:
@@ -117,7 +117,7 @@ ollama serve
 Yangi terminalda:
 
 ```bash
-ollama pull minmax2.5:cloud
+ollama pull minimax-m2.5:cloud
 ```
 
 ## Windows (PowerShell)
@@ -137,7 +137,7 @@ python -m pip install -r requirements.txt
 - Model pull qiling:
 
 ```powershell
-ollama pull minmax2.5:cloud
+ollama pull minimax-m2.5:cloud
 ```
 
 ## Ishga tushirish
@@ -182,7 +182,7 @@ python3 deepsec_bridge.py --server http://127.0.0.1:8888 --debug
 - `DEEPSEC_PORT` (default: `8888`)
 - `DEEPSEC_HOST` (default: `127.0.0.1`)
 - `DEEPSEC_OLLAMA_URL` (default: `http://127.0.0.1:11434`)
-- `DEEPSEC_OLLAMA_MODEL` (default: `minmax2.5:cloud`)
+- `DEEPSEC_OLLAMA_MODEL` (default: `minimax-m2.5:cloud`)
 - `DEEPSEC_OLLAMA_TIMEOUT` (default: `180`)
 - `DEEPSEC_AI_ENFORCE_OLLAMA` (default: `true`)
 
@@ -190,7 +190,7 @@ Linux/macOS misol:
 
 ```bash
 export DEEPSEC_OLLAMA_URL="http://127.0.0.1:11434"
-export DEEPSEC_OLLAMA_MODEL="minmax2.5:cloud"
+export DEEPSEC_OLLAMA_MODEL="minimax-m2.5:cloud"
 export DEEPSEC_AI_ENFORCE_OLLAMA="true"
 python3 deepsec_engine.py --production
 ```
@@ -199,7 +199,7 @@ Windows PowerShell misol:
 
 ```powershell
 $env:DEEPSEC_OLLAMA_URL = "http://127.0.0.1:11434"
-$env:DEEPSEC_OLLAMA_MODEL = "minmax2.5:cloud"
+$env:DEEPSEC_OLLAMA_MODEL = "minimax-m2.5:cloud"
 $env:DEEPSEC_AI_ENFORCE_OLLAMA = "true"
 python deepsec_engine.py --production
 ```
