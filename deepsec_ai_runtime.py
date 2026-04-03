@@ -128,10 +128,18 @@ class DeepSecOllamaRuntime:
 
             parsed = self._safe_parse_json(raw_text)
             if parsed is None:
+                parsed = self._repair_json_response(raw_text)
+
+            if parsed is None:
+                # Do not hard-fail on formatting-only issues. Endpoints can continue
+                # with deterministic fallback logic based on an empty JSON object.
                 return {
-                    "success": False,
+                    "success": True,
                     "model": self.model,
-                    "error": "Model response is not valid JSON",
+                    "json": {},
+                    "raw": payload,
+                    "warning": "Model response was not valid JSON; fallback empty JSON applied",
+                    "parse_error": True,
                     "raw_response": raw_text,
                 }
 
@@ -147,6 +155,41 @@ class DeepSecOllamaRuntime:
                 "model": self.model,
                 "error": str(exc),
             }
+
+    def _repair_json_response(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        """Run a strict JSON repair pass if the primary JSON parse fails."""
+        if not raw_text:
+            return None
+
+        repair_prompt = (
+            "Convert the following content into a strict JSON object. "
+            "Return only valid JSON with no markdown, no explanations, and no comments.\n\n"
+            f"CONTENT:\n{raw_text}"
+        )
+
+        body = {
+            "model": self.model,
+            "prompt": repair_prompt,
+            "format": "json",
+            "stream": False,
+            "options": {
+                "temperature": 0.0,
+                "num_predict": 700,
+            },
+        }
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/api/generate",
+                json=body,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            repaired_text = (payload.get("response", "") or "").strip()
+            return self._safe_parse_json(repaired_text)
+        except Exception:
+            return None
 
     @staticmethod
     def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
@@ -174,6 +217,49 @@ class DeepSecOllamaRuntime:
             try:
                 return json.loads(bracketed.group(1))
             except Exception:
+                pass
+
+        balanced = DeepSecOllamaRuntime._extract_first_json_object(text)
+        if balanced:
+            try:
+                return json.loads(balanced)
+            except Exception:
                 return None
+
+        return None
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> Optional[str]:
+        """Extract the first balanced JSON object from arbitrary text."""
+        start = text.find("{")
+        if start < 0:
+            return None
+
+        depth = 0
+        in_string = False
+        escape = False
+
+        for idx in range(start, len(text)):
+            ch = text[idx]
+
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:idx + 1]
 
         return None

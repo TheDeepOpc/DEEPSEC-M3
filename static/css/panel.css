@@ -199,7 +199,8 @@ button:disabled {
   padding: 0.9rem;
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 0.84rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
 }
 
 .ok {
