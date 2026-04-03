@@ -29,6 +29,7 @@ import os
 import pickle
 import queue
 import re as rex
+import shlex
 import shutil
 import signal as sigctl
 import socket as sockio
@@ -7201,6 +7202,7 @@ class EnhancedCommandExecutor:
                     logger.info(line)
 
             return {
+                "command": self.command,
                 "stdout": self.stdout_data,
                 "stderr": self.stderr_data,
                 "return_code": self.return_code,
@@ -7220,6 +7222,7 @@ class EnhancedCommandExecutor:
             telemetry.record_execution(False, execution_time)
 
             return {
+                "command": self.command,
                 "stdout": self.stdout_data,
                 "stderr": f"Error executing command: {str(e)}\n{self.stderr_data}",
                 "return_code": -1,
@@ -10202,8 +10205,40 @@ def intelligent_smart_scan():
             return jsonify({"error": "Target is required"}), 400
 
         target = data['target']
-        objective = data.get('objective', 'comprehensive')
-        max_tools = data.get('max_tools', 5)
+
+        valid_objectives = {"quick", "comprehensive", "stealth"}
+        autonomous_mode = bool(data.get("autonomous_mode", True))
+        objective_raw = str(data.get("objective", "") or "").strip().lower()
+        objective_provided = objective_raw in valid_objectives
+        objective = objective_raw if objective_provided else "comprehensive"
+
+        requested_max_tools = data.get('max_tools', 0)
+        try:
+            requested_max_tools = int(requested_max_tools)
+        except (TypeError, ValueError):
+            requested_max_tools = 0
+
+        # In autonomous mode, AI controls scan breadth unless explicitly overridden.
+        if autonomous_mode and not bool(data.get("respect_max_tools", False)):
+            requested_max_tools = 0
+
+        objective_defaults = {
+            "quick": 10,
+            "comprehensive": 24,
+            "stealth": 12,
+        }
+        auto_budget = requested_max_tools <= 0
+        if auto_budget:
+            max_tools = objective_defaults.get(objective, 24)
+        else:
+            max_tools = max(1, min(requested_max_tools, 30))
+
+        # Backward-compatibility: older panel builds sent 5 by default.
+        # Unless explicitly overridden, upgrade this legacy default to AI auto budget.
+        if requested_max_tools == 5 and not bool(data.get("respect_max_tools", False)):
+            max_tools = objective_defaults.get(objective, 24)
+            auto_budget = True
+
         trace_id = str(data.get('trace_id', '') or '').strip() or f"scan-{uuid.uuid4().hex[:12]}"
 
         live_event_bus.emit(
@@ -10214,6 +10249,8 @@ def intelligent_smart_scan():
                 "target": target,
                 "objective": objective,
                 "max_tools": max_tools,
+                "auto_budget": auto_budget,
+                "autonomous_mode": autonomous_mode,
             },
         )
 
@@ -10221,6 +10258,8 @@ def intelligent_smart_scan():
         normalized_input = target.strip()
         parsed_target = urlparse(normalized_input if '://' in normalized_input else f"https://{normalized_input}")
         host_target = (parsed_target.netloc or parsed_target.path or normalized_input).strip('/')
+        host_no_port = parsed_target.hostname or host_target.split(":")[0]
+        port_hint = parsed_target.port
         web_target = normalized_input if normalized_input.startswith(('http://', 'https://')) else f"https://{host_target}"
         ai_tool_catalog = build_tool_catalog_for_ai(max_per_category=50)
 
@@ -10230,8 +10269,187 @@ def intelligent_smart_scan():
             trace_id=trace_id,
             data={
                 "host_target": host_target,
+                "host_without_port": host_no_port,
+                "port_hint": port_hint,
                 "web_target": web_target,
             },
+        )
+
+        def _shell_quote(value: str) -> str:
+            text_value = str(value)
+            if os.name == "nt":
+                escaped_value = text_value.replace('"', '""')
+                return f'"{escaped_value}"'
+            return shlex.quote(text_value)
+
+        safe_host_token = _shell_quote(host_no_port)
+        safe_web_token = _shell_quote(web_target)
+        safe_web_fuzz_token = _shell_quote(f"{web_target.rstrip('/')}/FUZZ")
+
+        preflight_recon: Dict[str, Any] = {
+            "host": host_target,
+            "host_without_port": host_no_port,
+            "port_hint": port_hint,
+            "web_url": web_target,
+            "dns": {},
+            "ping": {},
+            "curl_head": {},
+            "http_probe": {},
+            "web_detected": False,
+            "target_kind": "unknown",
+            "target_hints": [],
+        }
+
+        live_event_bus.emit(
+            category="ai-thought",
+            message="AI reason: avval targetni tez aniqlash uchun DNS/ping/curl/HTTP probe qilaman",
+            trace_id=trace_id,
+        )
+
+        try:
+            dns_name, dns_aliases, dns_addresses = socket.gethostbyname_ex(host_no_port)
+            preflight_recon["dns"] = {
+                "resolved": True,
+                "hostname": dns_name,
+                "aliases": dns_aliases[:5],
+                "addresses": dns_addresses[:10],
+            }
+        except Exception as dns_exc:
+            preflight_recon["dns"] = {
+                "resolved": False,
+                "error": str(dns_exc),
+            }
+
+        if shutil.which("ping"):
+            ping_cmd = f"ping -n 1 {safe_host_token}" if os.name == "nt" else f"ping -c 1 {safe_host_token}"
+            ping_result = execute_command(ping_cmd, use_cache=False)
+            ping_stdout = str(ping_result.get("stdout", "") or "")
+            preflight_recon["ping"] = {
+                "command": ping_cmd,
+                "success": bool(ping_result.get("success", False)),
+                "latency_hint": ping_stdout[:220],
+                "error": str(ping_result.get("stderr", "") or "")[:220],
+            }
+
+        if shutil.which("curl"):
+            curl_cmd = f"curl -I -m 6 -sS {safe_web_token}"
+            curl_result = execute_command(curl_cmd, use_cache=False)
+            curl_head = str(curl_result.get("stdout", "") or "")
+            preflight_recon["curl_head"] = {
+                "command": curl_cmd,
+                "success": bool(curl_result.get("success", False)),
+                "response_excerpt": curl_head[:600],
+                "error": str(curl_result.get("stderr", "") or "")[:220],
+            }
+
+        try:
+            http_probe = requests.get(
+                web_target,
+                timeout=6,
+                allow_redirects=True,
+                headers={"User-Agent": "DeepSec-AI/6.0-Preflight"},
+            )
+            page_text = http_probe.text or ""
+            page_title = ""
+            content_type = str(http_probe.headers.get("Content-Type", "") or "")
+            if "html" in content_type.lower() and page_text:
+                soup = BeautifulSoup(page_text, "html.parser")
+                if soup.title and soup.title.text:
+                    page_title = soup.title.text.strip()[:140]
+
+            preflight_recon["http_probe"] = {
+                "success": True,
+                "final_url": str(http_probe.url),
+                "status_code": int(http_probe.status_code),
+                "content_type": content_type[:120],
+                "server": str(http_probe.headers.get("Server", "") or "")[:120],
+                "title": page_title,
+                "body_excerpt": page_text[:800],
+            }
+        except Exception as http_exc:
+            preflight_recon["http_probe"] = {
+                "success": False,
+                "error": str(http_exc),
+            }
+
+        http_probe_data = preflight_recon.get("http_probe", {})
+        curl_data = preflight_recon.get("curl_head", {})
+        page_title_lc = str(http_probe_data.get("title", "") or "").lower()
+        body_excerpt_lc = str(http_probe_data.get("body_excerpt", "") or "").lower()
+        content_type_lc = str(http_probe_data.get("content_type", "") or "").lower()
+
+        preflight_recon["web_detected"] = bool(http_probe_data.get("success") or curl_data.get("success"))
+
+        hints: List[str] = []
+        if preflight_recon["web_detected"]:
+            hints.append("reachable_web_target")
+        if "application/json" in content_type_lc:
+            hints.append("api_like_response")
+        if any(k in page_title_lc or k in body_excerpt_lc for k in ["bank", "payment", "wallet", "checkout", "transfer", "swift", "card"]):
+            hints.append("financial_keywords_detected")
+        if any(k in page_title_lc or k in body_excerpt_lc for k in ["login", "signin", "auth", "account", "dashboard"]):
+            hints.append("authentication_surface_detected")
+        if any(k in content_type_lc for k in ["html", "javascript", "json", "xml"]):
+            hints.append("application_layer_exposed")
+        preflight_recon["target_hints"] = hints
+
+        if "financial_keywords_detected" in hints:
+            preflight_recon["target_kind"] = "financial_web_application"
+        elif "api_like_response" in hints:
+            preflight_recon["target_kind"] = "api_service"
+        elif preflight_recon["web_detected"]:
+            preflight_recon["target_kind"] = "web_application"
+        elif preflight_recon.get("dns", {}).get("resolved"):
+            preflight_recon["target_kind"] = "host_or_network_service"
+
+        objective_auto_selected = False
+        objective_decision_reason = "Operator objective accepted" if objective_provided else "Default objective applied"
+        if autonomous_mode and not objective_provided:
+            target_kind = preflight_recon.get("target_kind", "unknown")
+            if target_kind in {"financial_web_application", "web_application", "api_service"}:
+                objective = "comprehensive"
+            elif target_kind == "host_or_network_service":
+                objective = "quick"
+            else:
+                objective = "quick"
+            objective_auto_selected = True
+            objective_decision_reason = f"AI selected objective from preflight target kind: {target_kind}"
+            if auto_budget:
+                max_tools = objective_defaults.get(objective, max_tools)
+
+        autonomous_decision = {
+            "enabled": autonomous_mode,
+            "objective": objective,
+            "objective_auto_selected": objective_auto_selected,
+            "objective_reason": objective_decision_reason,
+            "objective_provided_by_operator": objective_provided,
+            "auto_budget": auto_budget,
+            "tool_budget": max_tools,
+        }
+
+        live_event_bus.emit(
+            category="ai-thought",
+            message=(
+                f"AI preflight conclusion: target looks like {preflight_recon['target_kind']} "
+                f"(hints: {', '.join(preflight_recon['target_hints']) or 'none'})"
+            ),
+            trace_id=trace_id,
+            data={
+                "target_kind": preflight_recon["target_kind"],
+                "hints": preflight_recon["target_hints"],
+                "status_code": http_probe_data.get("status_code"),
+                "title": http_probe_data.get("title", ""),
+            },
+        )
+
+        live_event_bus.emit(
+            category="ai-thought",
+            message=(
+                f"AI autonomy decision: objective={objective}, budget={max_tools}, "
+                f"mode={'autonomous' if autonomous_mode else 'operator-assisted'}"
+            ),
+            trace_id=trace_id,
+            data=autonomous_decision,
         )
 
         logger.info(f" Starting intelligent smart scan for {target}")
@@ -10255,6 +10473,20 @@ def intelligent_smart_scan():
                 "authorized": True,
                 "requested_objective": objective,
                 "requested_max_tools": max_tools,
+                "autonomous_decision": autonomous_decision,
+                "preflight_recon": {
+                    "target_kind": preflight_recon.get("target_kind"),
+                    "target_hints": preflight_recon.get("target_hints", []),
+                    "dns": preflight_recon.get("dns", {}),
+                    "ping": preflight_recon.get("ping", {}),
+                    "curl_head": preflight_recon.get("curl_head", {}),
+                    "http_probe": {
+                        "success": preflight_recon.get("http_probe", {}).get("success", False),
+                        "status_code": preflight_recon.get("http_probe", {}).get("status_code"),
+                        "title": preflight_recon.get("http_probe", {}).get("title", ""),
+                        "content_type": preflight_recon.get("http_probe", {}).get("content_type", ""),
+                    },
+                },
             },
             temperature=0.1,
             num_predict=700,
@@ -10308,27 +10540,300 @@ def intelligent_smart_scan():
 
             ai_max_tools = ai_strategy.get("max_tools")
             if isinstance(ai_max_tools, int) and ai_max_tools > 0:
-                max_tools = max(1, min(ai_max_tools, 10))
+                max_tools = max(1, min(ai_max_tools, 30))
+
+        def _tool_runtime_available(tool_name: str) -> bool:
+            """Best-effort runtime availability check for /api/tools endpoints."""
+            internal_api_tools = {
+                "http-framework",
+                "browser-agent",
+                "burpsuite-alternative",
+                "api_fuzzer",
+                "graphql_scanner",
+                "jwt_analyzer",
+                "api_schema_analyzer",
+            }
+            if tool_name in internal_api_tools:
+                return True
+
+            binary_aliases = {
+                "zap": ["zaproxy", "zap"],
+                "netexec": ["nxc", "netexec"],
+                "nmap-advanced": ["nmap"],
+                "enum4linux-ng": ["enum4linux-ng"],
+                "scout-suite": ["scout", "scout-suite"],
+                "docker-bench-security": ["docker-bench-security", "docker-bench"],
+                "volatility3": ["volatility3", "vol"],
+                "gdb-peda": ["gdb"],
+                "one-gadget": ["one-gadget", "one_gadget"],
+                "libc-database": ["libc-database", "libcdb"],
+            }
+
+            candidates: List[str] = []
+            if tool_name in binary_aliases:
+                candidates.extend(binary_aliases[tool_name])
+
+            normalized = tool_name.lower()
+            candidates.append(normalized)
+            if "-" in normalized:
+                candidates.append(normalized.replace("-", ""))
+                candidates.append(normalized.replace("-", "_"))
+            if "_" in normalized:
+                candidates.append(normalized.replace("_", ""))
+                candidates.append(normalized.replace("_", "-"))
+
+            seen: Set[str] = set()
+            for candidate in candidates:
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                if shutil.which(candidate):
+                    return True
+
+            return False
+
+        registered_tool_catalog = build_registered_tool_catalog_snapshot()
+        registered_api_tools = registered_tool_catalog.get("registered_tools", [])
+        runtime_available_tools = [tool for tool in registered_api_tools if _tool_runtime_available(tool)]
+
+        if not runtime_available_tools:
+            runtime_available_tools = [
+                "nmap", "nuclei", "httpx", "katana", "ffuf", "dirsearch", "arjun", "paramspider",
+                "dalfox", "amass", "subfinder", "gobuster", "feroxbuster", "wpscan", "sqlmap", "nikto"
+            ]
+            planning_warnings.append("Runtime tool availability check returned empty; fallback baseline set applied")
+
+        live_event_bus.emit(
+            category="scan-status",
+            message=(
+                f"AI loaded tool inventory: {len(registered_api_tools)} registered, "
+                f"{len(runtime_available_tools)} runtime-available"
+            ),
+            trace_id=trace_id,
+            data={
+                "registered_tools": len(registered_api_tools),
+                "runtime_available_tools": len(runtime_available_tools),
+            },
+        )
 
         # Analyze target
         profile = recon_planner.analyze_target(target)
 
         # Select optimal tools
         selected_tools = recon_planner.select_optimal_tools(profile, objective)
+        selected_tools = [tool for tool in selected_tools if tool in runtime_available_tools]
 
         if isinstance(ai_strategy, dict):
             priority_tools = ai_strategy.get("tool_priority", [])
             if isinstance(priority_tools, list) and priority_tools:
-                selected_set = set(selected_tools)
-                prioritized = [tool for tool in priority_tools if tool in selected_set]
+                prioritized = [tool for tool in priority_tools if tool in runtime_available_tools]
                 remaining = [tool for tool in selected_tools if tool not in prioritized]
                 selected_tools = prioritized + remaining
 
-        selected_tools = selected_tools[:max_tools]
+        # Add fast-rotation tools early to maximize first findings.
+        fast_rotation = [
+            "httpx", "katana", "gau", "waybackurls", "arjun", "paramspider",
+            "ffuf", "dirsearch", "dalfox", "nuclei", "nmap", "subfinder", "amass"
+        ]
+        for tool in fast_rotation:
+            if tool in runtime_available_tools and tool not in selected_tools:
+                selected_tools.append(tool)
+
+        # Finally include the rest of runtime-available tools for broader coverage.
+        for tool in runtime_available_tools:
+            if tool not in selected_tools:
+                selected_tools.append(tool)
+
+        # Keep tool order stable while removing duplicates.
+        selected_tools = list(dict.fromkeys(selected_tools))
+
+        # Nikto is typically slower; keep it last or skip for speed-focused modes.
+        if "nikto" in selected_tools:
+            selected_tools = [tool for tool in selected_tools if tool != "nikto"] + ["nikto"]
+            if objective in {"quick", "stealth"}:
+                selected_tools = [tool for tool in selected_tools if tool != "nikto"]
 
         if not selected_tools:
-            selected_tools = ["nmap", "nuclei", "ffuf"][:max_tools]
-            planning_warnings.append("No tools selected by planner; default toolset applied")
+            selected_tools = runtime_available_tools.copy()
+            planning_warnings.append("Planner returned no executable tools; runtime executable pool applied")
+
+        initial_batch_limit = min(8, max_tools)
+        initial_tools = selected_tools[:initial_batch_limit]
+        queued_followup_tools = [tool for tool in selected_tools if tool not in initial_tools]
+
+        if not initial_tools:
+            initial_tools = runtime_available_tools[:min(max_tools, 8)]
+            planning_warnings.append("No tools selected by planner; default executable batch applied")
+
+        ai_autonomous_recon: Dict[str, Any] = {
+            "reasoning": "",
+            "planned_steps": [],
+            "executed_commands": [],
+        }
+
+        autonomous_step_templates: List[Dict[str, str]] = []
+        if preflight_recon.get("web_detected"):
+            autonomous_step_templates.append({
+                "id": "curl_head_refresh",
+                "name": "Refresh HTTP headers quickly",
+                "command": f"curl -I -m 6 -sS {safe_web_token}",
+                "purpose": "Confirm live HTTP headers and quick response profile",
+            })
+            if shutil.which("httpx"):
+                autonomous_step_templates.append({
+                    "id": "httpx_fingerprint",
+                    "name": "Fast HTTP fingerprint",
+                    "command": f"echo {safe_host_token} | httpx -silent -title -status-code -tech-detect -follow-redirects -timeout 5",
+                    "purpose": "Get fast app fingerprinting signals",
+                })
+            if shutil.which("katana"):
+                autonomous_step_templates.append({
+                    "id": "katana_quick_crawl",
+                    "name": "Quick crawl",
+                    "command": f"katana -u {safe_web_token} -silent -d 1 -jc -timeout 8",
+                    "purpose": "Get first endpoint surface quickly",
+                })
+            if shutil.which("nuclei"):
+                autonomous_step_templates.append({
+                    "id": "nuclei_hot_scan",
+                    "name": "Hot critical/high nuclei pass",
+                    "command": f"nuclei -u {safe_web_token} -severity critical,high -silent -rl 50 -c 20",
+                    "purpose": "Catch high-impact issues quickly",
+                })
+            if shutil.which("ffuf"):
+                autonomous_step_templates.append({
+                    "id": "ffuf_quick_dirs",
+                    "name": "Quick directory fuzz",
+                    "command": f"ffuf -u {safe_web_fuzz_token} -w /usr/share/wordlists/dirb/common.txt -mc all -fc 404 -t 40 -maxtime 20 -s",
+                    "purpose": "Find interesting paths without waiting for long scans",
+                })
+        else:
+            if shutil.which("ping"):
+                ping_cmd = f"ping -n 1 {safe_host_token}" if os.name == "nt" else f"ping -c 1 {safe_host_token}"
+                autonomous_step_templates.append({
+                    "id": "ping_probe",
+                    "name": "Host liveness check",
+                    "command": ping_cmd,
+                    "purpose": "Check if host responds quickly",
+                })
+            if shutil.which("nmap"):
+                autonomous_step_templates.append({
+                    "id": "nmap_top_ports",
+                    "name": "Top ports discovery",
+                    "command": f"nmap -Pn -T4 --top-ports 200 {safe_host_token}",
+                    "purpose": "Fast network surface discovery",
+                })
+            if shutil.which("subfinder"):
+                autonomous_step_templates.append({
+                    "id": "subfinder_quick",
+                    "name": "Quick subdomain lookup",
+                    "command": f"subfinder -d {safe_host_token} -silent",
+                    "purpose": "Find immediate subdomain targets",
+                })
+
+        max_autonomous_steps = 2 if objective == "quick" else 4
+        if autonomous_step_templates:
+            autonomous_plan_result = ollama_runtime.generate_json(
+                prompt=(
+                    "Return JSON with keys: reasoning (string) and selected_step_ids (list of strings). "
+                    "Pick the fastest steps that maximize early findings."
+                ),
+                system_prompt=(
+                    "You are DeepSec autonomous recon planner. Choose quick high-value steps first. "
+                    "Prefer speed over deep exhaustive scans. Return strict JSON only."
+                ),
+                context={
+                    "target": target,
+                    "objective": objective,
+                    "max_steps": max_autonomous_steps,
+                    "preflight_recon": {
+                        "target_kind": preflight_recon.get("target_kind"),
+                        "target_hints": preflight_recon.get("target_hints", []),
+                        "http_probe": preflight_recon.get("http_probe", {}),
+                    },
+                    "step_templates": [
+                        {
+                            "id": step["id"],
+                            "name": step["name"],
+                            "purpose": step["purpose"],
+                            "command": step["command"],
+                        }
+                        for step in autonomous_step_templates
+                    ],
+                },
+                temperature=0.1,
+                num_predict=500,
+            )
+
+            autonomous_plan = autonomous_plan_result.get("json", {}) if autonomous_plan_result.get("success") else {}
+            ai_autonomous_recon["reasoning"] = str(autonomous_plan.get("reasoning", "")) if isinstance(autonomous_plan, dict) else ""
+
+            if not autonomous_plan_result.get("success"):
+                planning_warnings.append(
+                    f"Autonomous quick-recon planning fallback used: {autonomous_plan_result.get('error', 'unknown error')}"
+                )
+
+            selected_step_ids = autonomous_plan.get("selected_step_ids", []) if isinstance(autonomous_plan, dict) else []
+            template_by_id = {item["id"]: item for item in autonomous_step_templates}
+
+            planned_steps = []
+            if isinstance(selected_step_ids, list):
+                planned_steps = [template_by_id[item_id] for item_id in selected_step_ids if item_id in template_by_id]
+
+            if not planned_steps:
+                planned_steps = autonomous_step_templates[:max_autonomous_steps]
+
+            planned_steps = planned_steps[:max_autonomous_steps]
+            ai_autonomous_recon["planned_steps"] = [step["id"] for step in planned_steps]
+
+            if ai_autonomous_recon["reasoning"]:
+                live_event_bus.emit(
+                    category="ai-thought",
+                    message=f"AI autonomous recon plan: {ai_autonomous_recon['reasoning']}",
+                    trace_id=trace_id,
+                    data={"planned_steps": ai_autonomous_recon["planned_steps"]},
+                )
+
+            for step in planned_steps:
+                live_event_bus.emit(
+                    category="scan-status",
+                    message=f"AI quick check -> {step['name']}",
+                    trace_id=trace_id,
+                    data={"step": step["id"], "command": step["command"]},
+                )
+
+                cmd_result = execute_command(step["command"], use_cache=False)
+                stdout_text = str(cmd_result.get("stdout", "") or "")
+                stderr_text = str(cmd_result.get("stderr", "") or "")
+                cmd_success = bool(cmd_result.get("success", False))
+                result_entry = {
+                    "step_id": step["id"],
+                    "name": step["name"],
+                    "purpose": step["purpose"],
+                    "command": step["command"],
+                    "status": "success" if cmd_success else "failed",
+                    "success": cmd_success,
+                    "execution_time": cmd_result.get("execution_time", 0),
+                    "stdout_excerpt": stdout_text[:700],
+                    "stderr_excerpt": stderr_text[:300],
+                    "error": str(cmd_result.get("error", "") or "")[:220],
+                }
+                ai_autonomous_recon["executed_commands"].append(result_entry)
+
+                live_event_bus.emit(
+                    category="ai-thought",
+                    message=(
+                        f"AI quick check result ({step['id']}): "
+                        f"{'success' if cmd_success else 'failed'}"
+                    ),
+                    trace_id=trace_id,
+                    level="info" if cmd_success else "warning",
+                    data={
+                        "step": step["id"],
+                        "stdout_excerpt": stdout_text[:220],
+                        "stderr_excerpt": stderr_text[:220],
+                    },
+                )
 
         for warning_text in planning_warnings:
             live_event_bus.emit(
@@ -10340,9 +10845,17 @@ def intelligent_smart_scan():
 
         live_event_bus.emit(
             category="scan-status",
-            message=f"AI selected {len(selected_tools)} tools: {', '.join(selected_tools)}",
+            message=(
+                f"AI phase-1 selected {len(initial_tools)} tools. "
+                f"Total scan budget: {max_tools} tools"
+            ),
             trace_id=trace_id,
-            data={"selected_tools": selected_tools},
+            data={
+                "phase_1_tools": initial_tools,
+                "queued_tools": queued_followup_tools,
+                "tool_budget": max_tools,
+                "auto_budget": auto_budget,
+            },
         )
 
         # Execute tools in parallel with real tool execution
@@ -10350,14 +10863,127 @@ def intelligent_smart_scan():
             "target": target,
             "normalized_target": {
                 "host": host_target,
+                "host_without_port": host_no_port,
                 "web_url": web_target,
             },
+            "autonomous_decision": autonomous_decision,
+            "preflight_recon": preflight_recon,
+            "ai_autonomous_recon": ai_autonomous_recon,
             "target_profile": profile.to_dict(),
             "tools_executed": [],
             "total_vulnerabilities": 0,
             "execution_summary": {},
             "combined_output": ""
         }
+
+        def execute_tool_via_api_endpoint(tool_name: str, effective_target: str, optimized_params: Dict[str, Any]) -> Dict[str, Any]:
+            """Execute any registered /api/tools/<tool> endpoint with adaptive payload defaults."""
+            endpoint_path = f"/api/tools/{tool_name}"
+            payload = dict(optimized_params or {})
+
+            payload.setdefault("target", effective_target)
+            payload.setdefault("url", web_target)
+            payload.setdefault("domain", host_no_port)
+            payload.setdefault("host", host_no_port)
+            payload.setdefault("use_recovery", True)
+
+            if port_hint and not payload.get("ports") and tool_name in {"nmap", "nmap-advanced", "masscan", "rustscan"}:
+                payload["ports"] = str(port_hint)
+
+            # Lightweight defaults to keep scans responsive.
+            if objective in {"quick", "stealth"}:
+                payload.setdefault("threads", 35)
+                payload.setdefault("timeout", 20)
+            else:
+                payload.setdefault("threads", 20)
+                payload.setdefault("timeout", 35)
+
+            # Target-shape specialization for common endpoint contracts.
+            web_route_tools = {
+                "gobuster", "nuclei", "nikto", "sqlmap", "ffuf", "feroxbuster", "katana",
+                "wpscan", "dirsearch", "arjun", "dalfox", "jaeles", "xsser", "wfuzz", "x8",
+                "http-framework", "browser-agent", "burpsuite-alternative", "zap"
+            }
+            domain_route_tools = {"amass", "subfinder", "paramspider", "fierce", "dnsenum", "gau", "waybackurls"}
+            network_route_tools = {
+                "nmap", "nmap-advanced", "masscan", "rustscan", "enum4linux", "enum4linux-ng",
+                "rpcclient", "smbmap", "netexec", "nbtscan", "arp-scan", "responder"
+            }
+
+            if tool_name in web_route_tools:
+                payload["url"] = web_target
+                payload["target"] = web_target
+            elif tool_name in domain_route_tools:
+                payload["domain"] = host_no_port
+                payload["target"] = host_no_port
+            elif tool_name in network_route_tools:
+                payload["target"] = host_no_port
+
+            if tool_name == "httpx":
+                payload["target"] = web_target
+                payload.setdefault("tech_detect", True)
+                payload.setdefault("status_code", True)
+                payload.setdefault("title", True)
+
+            if tool_name == "nuclei":
+                payload.setdefault("severity", "critical,high" if objective in {"quick", "stealth"} else "critical,high,medium")
+
+            if "additional_args" not in payload:
+                payload["additional_args"] = ""
+
+            try:
+                with app.test_client() as client:
+                    response = client.post(endpoint_path, json=payload)
+                    response_data = response.get_json(silent=True) or {}
+
+                if response.status_code == 404:
+                    return {
+                        "success": False,
+                        "error": f"Tool endpoint not found: {endpoint_path}",
+                        "stdout": "",
+                        "stderr": "",
+                        "command": "",
+                        "execution_time": 0,
+                    }
+
+                if response.status_code >= 400:
+                    error_msg = response_data.get("error") or response_data.get("details") or f"HTTP {response.status_code}"
+                    return {
+                        "success": False,
+                        "error": str(error_msg),
+                        "stdout": str(response_data.get("stdout", "") or ""),
+                        "stderr": str(response_data.get("stderr", "") or ""),
+                        "command": str(response_data.get("command", "") or ""),
+                        "execution_time": float(response_data.get("execution_time", 0) or 0),
+                    }
+
+                success_value = response_data.get("success")
+                if success_value is None:
+                    success_value = not bool(response_data.get("error"))
+
+                stdout_value = response_data.get("stdout", "")
+                if not stdout_value and response_data.get("output"):
+                    stdout_value = response_data.get("output")
+                if not stdout_value and isinstance(response_data.get("results"), (dict, list)):
+                    stdout_value = json.dumps(response_data.get("results"), default=str)
+
+                return {
+                    "success": bool(success_value),
+                    "error": str(response_data.get("error", "") or ""),
+                    "stdout": str(stdout_value or ""),
+                    "stderr": str(response_data.get("stderr", "") or ""),
+                    "command": str(response_data.get("command", "") or ""),
+                    "execution_time": float(response_data.get("execution_time", 0) or 0),
+                }
+            except Exception as endpoint_exc:
+                return {
+                    "success": False,
+                    "error": f"Endpoint execution failed for {tool_name}: {str(endpoint_exc)}",
+                    "stdout": "",
+                    "stderr": "",
+                    "command": "",
+                    "execution_time": 0,
+                }
 
         def execute_single_tool(tool_name, target, profile):
             """Execute a single tool and return results"""
@@ -10378,13 +11004,18 @@ def intelligent_smart_scan():
                     'katana', 'httpx', 'wpscan', 'dirsearch', 'arjun', 'dalfox'
                 }
                 domain_tools = {'amass', 'subfinder', 'paramspider'}
+                network_tools = {'nmap', 'nmap-advanced', 'masscan', 'rustscan'}
 
                 if tool_name in web_tools:
                     effective_target = web_target
                 elif tool_name in domain_tools:
-                    effective_target = host_target
+                    effective_target = host_no_port
                 else:
-                    effective_target = host_target
+                    effective_target = host_no_port
+
+                if tool_name in network_tools and port_hint and not optimized_params.get("ports"):
+                    optimized_params = dict(optimized_params)
+                    optimized_params["ports"] = str(port_hint)
 
                 # Map tool names to their actual execution functions
                 tool_execution_map = {
@@ -10409,129 +11040,116 @@ def intelligent_smart_scan():
                 # Execute the tool if we have a mapping for it
                 if tool_name in tool_execution_map:
                     result = tool_execution_map[tool_name]()
+                else:
+                    result = execute_tool_via_api_endpoint(tool_name, effective_target, optimized_params)
 
-                    stdout_text = result.get('stdout', '') or ''
-                    stderr_text = result.get('stderr', '') or ''
-                    combined_output = f"{stdout_text}\n{stderr_text}".lower()
+                stdout_text = result.get('stdout', '') or ''
+                stderr_text = result.get('stderr', '') or ''
+                combined_output = f"{stdout_text}\n{stderr_text}".lower()
 
-                    connectivity_error_markers = [
-                        "connection refused",
-                        "unable to connect",
-                        "unable to connect to the target",
-                        "failed to establish a new connection",
-                        "name or service not known",
-                        "temporary failure in name resolution",
-                        "timed out",
-                        "connection reset",
-                        "no route to host",
-                        "target is down",
-                    ]
+                connectivity_error_markers = [
+                    "connection refused",
+                    "unable to connect",
+                    "unable to connect to the target",
+                    "failed to establish a new connection",
+                    "name or service not known",
+                    "temporary failure in name resolution",
+                    "timed out",
+                    "connection reset",
+                    "no route to host",
+                    "target is down",
+                ]
 
-                    runtime_error_markers = [
-                        "traceback (most recent call last)",
-                        "module not found",
-                        "command not found",
-                        "permission denied",
-                        "fatal error",
-                    ]
+                runtime_error_markers = [
+                    "traceback (most recent call last)",
+                    "module not found",
+                    "command not found",
+                    "permission denied",
+                    "fatal error",
+                ]
 
-                    has_connectivity_error = any(marker in combined_output for marker in connectivity_error_markers)
-                    has_runtime_error = any(marker in combined_output for marker in runtime_error_markers)
+                has_connectivity_error = any(marker in combined_output for marker in connectivity_error_markers)
+                has_runtime_error = any(marker in combined_output for marker in runtime_error_markers)
 
-                    tool_success = bool(result.get('success', False)) and not (has_connectivity_error or has_runtime_error)
+                tool_success = bool(result.get('success', False)) and not (has_connectivity_error or has_runtime_error)
 
-                    failure_reason = ""
-                    if not tool_success:
-                        if has_connectivity_error:
-                            failure_reason = "Target unreachable or connection failed during scan"
-                        elif has_runtime_error:
-                            failure_reason = "Tool execution reported runtime errors"
-                        else:
-                            failure_reason = str(result.get('error', '') or '')
+                failure_reason = ""
+                if not tool_success:
+                    if has_connectivity_error:
+                        failure_reason = "Target unreachable or connection failed during scan"
+                    elif has_runtime_error:
+                        failure_reason = "Tool execution reported runtime errors"
+                    else:
+                        failure_reason = str(result.get('error', '') or '')
 
-                    # Extract vulnerability count using high-confidence indicators only.
-                    vuln_count = 0
-                    if tool_success and stdout_text:
-                        if tool_name == 'sqlmap':
-                            sqlmap_positive = (
-                                "sql injection vulnerability has been detected" in combined_output or
-                                "identified the following injection point" in combined_output or
-                                ("is vulnerable" in combined_output and "sql" in combined_output)
-                            )
-                            vuln_count = 1 if sqlmap_positive else 0
-                        elif tool_name == 'nuclei':
-                            vuln_count = sum(
-                                combined_output.count(tag)
-                                for tag in ('[critical]', '[high]', '[medium]', '[low]')
-                            )
-                        else:
-                            generic_positive_markers = [
-                                "vulnerability found",
-                                "is vulnerable",
-                                "cve-",
-                                "remote code execution",
-                                "command injection",
-                                "sql injection",
-                                "cross-site scripting",
-                                "xss vulnerability",
-                                "csrf vulnerability",
-                                "directory traversal",
-                                "local file inclusion",
-                                " rce ",
-                            ]
-                            vuln_count = 1 if any(marker in combined_output for marker in generic_positive_markers) else 0
+                # Extract vulnerability count using high-confidence indicators only.
+                vuln_count = 0
+                if tool_success and stdout_text:
+                    if tool_name == 'sqlmap':
+                        sqlmap_positive = (
+                            "sql injection vulnerability has been detected" in combined_output or
+                            "identified the following injection point" in combined_output or
+                            ("is vulnerable" in combined_output and "sql" in combined_output)
+                        )
+                        vuln_count = 1 if sqlmap_positive else 0
+                    elif tool_name == 'nuclei':
+                        vuln_count = sum(
+                            combined_output.count(tag)
+                            for tag in ('[critical]', '[high]', '[medium]', '[low]')
+                        )
+                    else:
+                        generic_positive_markers = [
+                            "vulnerability found",
+                            "is vulnerable",
+                            "cve-",
+                            "remote code execution",
+                            "command injection",
+                            "sql injection",
+                            "cross-site scripting",
+                            "xss vulnerability",
+                            "csrf vulnerability",
+                            "directory traversal",
+                            "local file inclusion",
+                            " rce ",
+                        ]
+                        vuln_count = 1 if any(marker in combined_output for marker in generic_positive_markers) else 0
 
-                    completion_message = f"{tool_name} completed with status: {'success' if tool_success else 'failed'}"
-                    if tool_success:
-                        completion_message += f"; findings flagged: {vuln_count}"
-                    elif failure_reason:
-                        completion_message += f"; reason: {failure_reason}"
+                command_text = result.get('command', '') or ''
 
-                    live_event_bus.emit(
-                        category="tool-result",
-                        message=completion_message,
-                        trace_id=trace_id,
-                        level="info" if tool_success else "warning",
-                        data={
-                            "tool": tool_name,
-                            "effective_target": effective_target,
-                            "command": result.get('command', ''),
-                            "vulnerabilities_found": vuln_count,
-                            "error": failure_reason,
-                        },
-                    )
+                completion_message = f"{tool_name} completed with status: {'success' if tool_success else 'failed'}"
+                if tool_success:
+                    completion_message += f"; findings flagged: {vuln_count}"
+                elif failure_reason:
+                    completion_message += f"; reason: {failure_reason}"
 
-                    return {
+                live_event_bus.emit(
+                    category="tool-result",
+                    message=completion_message,
+                    trace_id=trace_id,
+                    level="info" if tool_success else "warning",
+                    data={
                         "tool": tool_name,
                         "effective_target": effective_target,
-                        "parameters": optimized_params,
-                        "status": "success" if tool_success else "failed",
-                        "timestamp": datetime.now().isoformat(),
-                        "execution_time": result.get('execution_time', 0),
-                        "stdout": stdout_text,
-                        "stderr": stderr_text,
+                        "command": command_text,
                         "vulnerabilities_found": vuln_count,
-                        "command": result.get('command', ''),
-                        "success": tool_success,
                         "error": failure_reason,
-                    }
-                else:
-                    logger.warning(f" No execution mapping found for tool: {tool_name}")
-                    live_event_bus.emit(
-                        category="tool-result",
-                        message=f"{tool_name} skipped because no execution mapping exists",
-                        trace_id=trace_id,
-                        level="warning",
-                        data={"tool": tool_name, "status": "skipped"},
-                    )
-                    return {
-                        "tool": tool_name,
-                        "parameters": optimized_params,
-                        "status": "skipped",
-                        "timestamp": datetime.now().isoformat(),
-                        "error": f"Tool {tool_name} not implemented in execution map",
-                        "success": False
-                    }
+                    },
+                )
+
+                return {
+                    "tool": tool_name,
+                    "effective_target": effective_target,
+                    "parameters": optimized_params,
+                    "status": "success" if tool_success else "failed",
+                    "timestamp": datetime.now().isoformat(),
+                    "execution_time": result.get('execution_time', 0),
+                    "stdout": stdout_text,
+                    "stderr": stderr_text,
+                    "vulnerabilities_found": vuln_count,
+                    "command": command_text,
+                    "success": tool_success,
+                    "error": failure_reason,
+                }
 
             except Exception as e:
                 logger.error(f" Error executing {tool_name}: {str(e)}")
@@ -10550,56 +11168,213 @@ def intelligent_smart_scan():
                     "success": False
                 }
 
-        # Execute tools in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(len(selected_tools), 5)) as executor:
-            # Submit all tool executions
-            future_to_tool = {
-                executor.submit(execute_single_tool, tool, target, profile): tool
-                for tool in selected_tools
-            }
+        adaptive_phase_notes: List[Dict[str, Any]] = []
+        executed_tool_names: Set[str] = set()
 
-            # Collect results as they complete
-            completed_count = 0
-            for future in as_completed(future_to_tool):
-                tool_result = future.result()
-                scan_results["tools_executed"].append(tool_result)
-                completed_count += 1
+        def execute_tool_batch(tool_batch: List[str], phase_label: str) -> None:
+            """Run one phase of tools in parallel and aggregate results into scan_results."""
+            if not tool_batch:
+                return
 
-                live_event_bus.emit(
-                    category="scan-status",
-                    message=(
-                        f"Progress {completed_count}/{len(selected_tools)}: "
-                        f"{tool_result.get('tool', 'tool')} -> {tool_result.get('status', 'unknown')}"
+            live_event_bus.emit(
+                category="scan-status",
+                message=f"Starting {phase_label} with {len(tool_batch)} tools",
+                trace_id=trace_id,
+                data={"phase": phase_label, "tools": tool_batch},
+            )
+
+            with ThreadPoolExecutor(max_workers=min(len(tool_batch), 5)) as executor:
+                future_to_tool = {
+                    executor.submit(execute_single_tool, tool, target, profile): tool
+                    for tool in tool_batch
+                }
+
+                for future in as_completed(future_to_tool):
+                    tool_result = future.result()
+                    scan_results["tools_executed"].append(tool_result)
+
+                    completed_count = len(scan_results["tools_executed"])
+                    live_event_bus.emit(
+                        category="scan-status",
+                        message=(
+                            f"Progress {completed_count}/{max_tools}: "
+                            f"{tool_result.get('tool', 'tool')} -> {tool_result.get('status', 'unknown')}"
+                        ),
+                        trace_id=trace_id,
+                        data={"completed": completed_count, "total": max_tools, "phase": phase_label},
+                    )
+
+                    if tool_result.get("vulnerabilities_found"):
+                        scan_results["total_vulnerabilities"] += tool_result["vulnerabilities_found"]
+
+                    if tool_result.get("stdout"):
+                        scan_results["combined_output"] += f"\n=== {tool_result['tool'].upper()} OUTPUT ===\n"
+                        scan_results["combined_output"] += tool_result["stdout"]
+                        scan_results["combined_output"] += "\n" + "=" * 50 + "\n"
+
+        phase1_tools = [tool for tool in initial_tools if tool not in executed_tool_names][:max_tools]
+        execute_tool_batch(phase1_tools, "phase-1")
+        executed_tool_names.update(phase1_tools)
+        adaptive_phase_notes.append({
+            "phase": "phase-1",
+            "reason": "Initial AI planning batch",
+            "tools": phase1_tools,
+        })
+
+        phase_index = 2
+        while len(scan_results["tools_executed"]) < max_tools and phase_index <= 5:
+            remaining_budget = max_tools - len(scan_results["tools_executed"])
+            if remaining_budget <= 0:
+                break
+
+            phase_tools: List[str] = []
+            phase_reason = ""
+
+            if queued_followup_tools:
+                phase_tools = queued_followup_tools[:min(remaining_budget, 5)]
+                queued_followup_tools = queued_followup_tools[len(phase_tools):]
+                phase_reason = "Continuing queued planner tools"
+            else:
+                followup_candidates = [tool for tool in runtime_available_tools if tool not in executed_tool_names]
+                if not followup_candidates:
+                    break
+
+                followup_plan_result = ollama_runtime.generate_json(
+                    prompt=(
+                        "Return JSON with keys: next_tools (list of strings), reasoning (string), and stop (boolean). "
+                        "Choose only from followup_candidates."
                     ),
-                    trace_id=trace_id,
-                    data={"completed": completed_count, "total": len(selected_tools)},
+                    system_prompt=(
+                        "You are DeepSec adaptive scan orchestrator for explicitly authorized testing. "
+                        "If enough evidence is collected, set stop=true. Otherwise return the next best tools. "
+                        "Return strict JSON only."
+                    ),
+                    context={
+                        "target": target,
+                        "objective": objective,
+                        "remaining_budget": remaining_budget,
+                        "followup_candidates": followup_candidates,
+                        "execution_summary": {
+                            "executed_tools": [item.get("tool") for item in scan_results["tools_executed"]],
+                            "total_findings": scan_results["total_vulnerabilities"],
+                            "successful_tools": len([t for t in scan_results["tools_executed"] if t.get("success")]),
+                            "failed_tools": len([t for t in scan_results["tools_executed"] if not t.get("success")]),
+                        },
+                        "recent_tool_digests": [
+                            {
+                                "tool": item.get("tool"),
+                                "status": item.get("status"),
+                                "vulnerabilities_found": item.get("vulnerabilities_found", 0),
+                                "error": item.get("error", ""),
+                            }
+                            for item in scan_results["tools_executed"][-8:]
+                        ],
+                    },
+                    temperature=0.1,
+                    num_predict=500,
                 )
 
-                # Accumulate vulnerability count
-                if tool_result.get("vulnerabilities_found"):
-                    scan_results["total_vulnerabilities"] += tool_result["vulnerabilities_found"]
+                followup_plan = followup_plan_result.get("json", {}) if followup_plan_result.get("success") else {}
 
-                # Combine outputs
-                if tool_result.get("stdout"):
-                    scan_results["combined_output"] += f"\n=== {tool_result['tool'].upper()} OUTPUT ===\n"
-                    scan_results["combined_output"] += tool_result["stdout"]
-                    scan_results["combined_output"] += "\n" + "="*50 + "\n"
+                if not followup_plan_result.get("success"):
+                    warning_text = f"Adaptive follow-up planning failed; using heuristic continuation: {followup_plan_result.get('error', 'unknown error')}"
+                    planning_warnings.append(warning_text)
+                    live_event_bus.emit(
+                        category="ai-thought",
+                        message=warning_text,
+                        trace_id=trace_id,
+                        level="warning",
+                    )
+
+                elif followup_plan_result.get("parse_error"):
+                    warning_text = followup_plan_result.get("warning", "Adaptive follow-up parse fallback applied")
+                    planning_warnings.append(warning_text)
+                    live_event_bus.emit(
+                        category="ai-thought",
+                        message=warning_text,
+                        trace_id=trace_id,
+                        level="warning",
+                    )
+
+                requested_next_tools = followup_plan.get("next_tools", []) if isinstance(followup_plan, dict) else []
+                if isinstance(requested_next_tools, list):
+                    phase_tools = [
+                        str(tool).strip()
+                        for tool in requested_next_tools
+                        if str(tool).strip() in followup_candidates
+                    ]
+                    phase_tools = list(dict.fromkeys(phase_tools))
+
+                phase_reason = str(followup_plan.get("reasoning", "AI selected adaptive follow-up tools")) if isinstance(followup_plan, dict) else "AI selected adaptive follow-up tools"
+                should_stop = bool(followup_plan.get("stop", False)) if isinstance(followup_plan, dict) else False
+                if should_stop and not phase_tools:
+                    live_event_bus.emit(
+                        category="ai-thought",
+                        message="AI decided current evidence is sufficient and stopped additional phases",
+                        trace_id=trace_id,
+                    )
+                    break
+
+                if not phase_tools:
+                    heuristic_priority = [
+                        "httpx", "katana", "arjun", "paramspider", "nuclei", "sqlmap",
+                        "ffuf", "dirsearch", "dalfox", "nikto", "nmap", "subfinder",
+                        "amass", "gobuster", "feroxbuster", "wpscan"
+                    ]
+                    phase_tools = [tool for tool in heuristic_priority if tool in followup_candidates][:min(remaining_budget, 4)]
+                    phase_reason = "Heuristic follow-up (AI follow-up returned no concrete tools)"
+
+            phase_tools = [tool for tool in phase_tools if tool not in executed_tool_names]
+            phase_tools = phase_tools[:min(remaining_budget, 5)]
+            if not phase_tools:
+                break
+
+            live_event_bus.emit(
+                category="ai-thought",
+                message=f"AI decided {len(phase_tools)} tools for phase-{phase_index}: {', '.join(phase_tools)}",
+                trace_id=trace_id,
+                data={"phase": f"phase-{phase_index}", "reason": phase_reason, "tools": phase_tools},
+            )
+
+            execute_tool_batch(phase_tools, f"phase-{phase_index}")
+            executed_tool_names.update(phase_tools)
+            adaptive_phase_notes.append({
+                "phase": f"phase-{phase_index}",
+                "reason": phase_reason,
+                "tools": phase_tools,
+            })
+            phase_index += 1
 
         # Create execution summary
         successful_tools = [t for t in scan_results["tools_executed"] if t.get("success")]
         failed_tools = [t for t in scan_results["tools_executed"] if not t.get("success")]
+        total_executed_tools = len(scan_results["tools_executed"])
 
         scan_results["execution_summary"] = {
-            "total_tools": len(selected_tools),
+            "total_tools": total_executed_tools,
             "successful_tools": len(successful_tools),
             "failed_tools": len(failed_tools),
-            "success_rate": len(successful_tools) / len(selected_tools) * 100 if selected_tools else 0,
+            "success_rate": len(successful_tools) / total_executed_tools * 100 if total_executed_tools else 0,
             "total_execution_time": sum(t.get("execution_time", 0) for t in scan_results["tools_executed"]),
-            "tools_used": [t["tool"] for t in successful_tools]
+            "tools_used": [t["tool"] for t in successful_tools],
+            "tool_budget": max_tools,
+            "adaptive_phases": adaptive_phase_notes,
         }
 
         # Command replay and concise digests for post-scan reporting.
-        command_replay = [
+        autonomous_command_replay = [
+            {
+                "tool": f"ai-quick::{item.get('step_id', 'step')}",
+                "status": item.get("status", "unknown"),
+                "effective_target": web_target if preflight_recon.get("web_detected") else host_target,
+                "command": item.get("command", ""),
+                "error": item.get("error", "") or item.get("stderr_excerpt", ""),
+                "vulnerabilities_found": 0,
+            }
+            for item in ai_autonomous_recon.get("executed_commands", [])
+        ]
+
+        command_replay = autonomous_command_replay + [
             {
                 "tool": item.get("tool"),
                 "status": item.get("status"),
@@ -10643,6 +11418,19 @@ def intelligent_smart_scan():
                     "web_url": web_target,
                 },
                 "objective": objective,
+                "preflight_recon": {
+                    "target_kind": preflight_recon.get("target_kind"),
+                    "target_hints": preflight_recon.get("target_hints", []),
+                    "dns": preflight_recon.get("dns", {}),
+                    "ping": preflight_recon.get("ping", {}),
+                    "http_probe": {
+                        "success": preflight_recon.get("http_probe", {}).get("success", False),
+                        "status_code": preflight_recon.get("http_probe", {}).get("status_code"),
+                        "title": preflight_recon.get("http_probe", {}).get("title", ""),
+                        "content_type": preflight_recon.get("http_probe", {}).get("content_type", ""),
+                    },
+                },
+                "autonomous_quick_checks": ai_autonomous_recon,
                 "execution_summary": scan_results["execution_summary"],
                 "tool_digests": tool_digests,
             },
@@ -10702,19 +11490,95 @@ def intelligent_smart_scan():
                 data={"error": ai_summary_result.get("error", "unknown error")},
             )
 
+        report_lines: List[str] = []
+        report_lines.append("DEEPSEC OPERATION REPORT")
+        report_lines.append("")
+        report_lines.append(f"Target: {target}")
+        report_lines.append(f"Mode: {'AUTONOMOUS' if autonomous_mode else 'OPERATOR-ASSISTED'}")
+        report_lines.append(f"Objective: {objective}")
+        report_lines.append(f"Trace ID: {trace_id}")
+        report_lines.append("")
+        report_lines.append("0) AI AUTONOMY DECISION")
+        report_lines.append(f"- Objective source: {'AI auto-selected' if objective_auto_selected else 'operator/default'}")
+        report_lines.append(f"- Objective reason: {objective_decision_reason}")
+        report_lines.append(f"- Tool budget: {max_tools} (auto_budget={auto_budget})")
+        report_lines.append("")
+        report_lines.append("1) AI PRE-FLIGHT REASONING")
+        report_lines.append(f"- Target kind: {preflight_recon.get('target_kind', 'unknown')}")
+        report_lines.append(f"- Hints: {', '.join(preflight_recon.get('target_hints', [])) or 'none'}")
+        if preflight_recon.get("http_probe", {}).get("success"):
+            report_lines.append(
+                f"- HTTP: {preflight_recon.get('http_probe', {}).get('status_code', 'n/a')} | "
+                f"{preflight_recon.get('http_probe', {}).get('content_type', 'n/a')} | "
+                f"title={preflight_recon.get('http_probe', {}).get('title', '')}"
+            )
+        else:
+            report_lines.append("- HTTP probe failed or target not reachable over web")
+
+        report_lines.append("")
+        report_lines.append("2) AI AUTONOMOUS QUICK CHECKS")
+        if ai_autonomous_recon.get("reasoning"):
+            report_lines.append(f"- AI reasoning: {ai_autonomous_recon.get('reasoning')}")
+        for idx, item in enumerate(ai_autonomous_recon.get("executed_commands", []), start=1):
+            report_lines.append(
+                f"- [{idx}] {item.get('step_id', 'step')} -> {item.get('status', 'unknown')} | {item.get('command', '')}"
+            )
+            excerpt = (item.get("stdout_excerpt", "") or item.get("stderr_excerpt", "") or "").strip()
+            if excerpt:
+                report_lines.append(f"  excerpt: {excerpt[:220]}")
+            if item.get("error"):
+                report_lines.append(f"  error: {item.get('error')}")
+        if not ai_autonomous_recon.get("executed_commands"):
+            report_lines.append("- No autonomous quick command executed")
+
+        report_lines.append("")
+        report_lines.append("3) ADAPTIVE TOOL EXECUTION")
+        report_lines.append(
+            f"- Tools success: {len(successful_tools)}/{total_executed_tools} | "
+            f"Potential findings: {scan_results['total_vulnerabilities']}"
+        )
+        for phase in scan_results.get("execution_summary", {}).get("adaptive_phases", []):
+            report_lines.append(
+                f"- {phase.get('phase', 'phase')}: {', '.join(phase.get('tools', []))} | reason: {phase.get('reason', '')}"
+            )
+
+        report_lines.append("")
+        report_lines.append("4) AI EXECUTIVE SUMMARY")
+        report_lines.append(f"- {ai_scan_summary.get('executive_summary', 'No executive summary')}")
+        for finding in ai_scan_summary.get("key_findings", [])[:10]:
+            report_lines.append(f"- finding: {finding}")
+
+        report_lines.append("")
+        report_lines.append("5) RECOMMENDED NEXT STEPS")
+        for step in ai_scan_summary.get("recommended_next_steps", [])[:10]:
+            report_lines.append(f"- {step}")
+        if not ai_scan_summary.get("recommended_next_steps"):
+            report_lines.append("- Re-run with broader objective if additional coverage is required")
+
+        report_lines.append("")
+        report_lines.append("6) COMMAND TIMELINE")
+        for idx, item in enumerate(command_replay, start=1):
+            report_lines.append(
+                f"- [{idx}] {item.get('tool', 'tool')} -> {item.get('status', 'unknown')} | {item.get('command', '')}"
+            )
+            if item.get("error"):
+                report_lines.append(f"  error: {item.get('error')}")
+
+        operation_report = "\n".join(report_lines)
+
         logger.info(f" Intelligent smart scan completed for {target}")
-        logger.info(f" Results: {len(successful_tools)}/{len(selected_tools)} tools successful, {scan_results['total_vulnerabilities']} vulnerabilities found")
+        logger.info(f" Results: {len(successful_tools)}/{total_executed_tools} tools successful, {scan_results['total_vulnerabilities']} vulnerabilities found")
 
         live_event_bus.emit(
             category="scan-status",
             message=(
-                f"AI pentest completed: {len(successful_tools)}/{len(selected_tools)} tools succeeded, "
+                f"AI pentest completed: {len(successful_tools)}/{total_executed_tools} tools succeeded, "
                 f"{scan_results['total_vulnerabilities']} potential findings"
             ),
             trace_id=trace_id,
             data={
                 "successful_tools": len(successful_tools),
-                "total_tools": len(selected_tools),
+                "total_tools": total_executed_tools,
                 "total_vulnerabilities": scan_results["total_vulnerabilities"],
             },
         )
@@ -10722,6 +11586,8 @@ def intelligent_smart_scan():
         return jsonify({
             "success": True,
             "trace_id": trace_id,
+            "autonomous_mode": autonomous_mode,
+            "autonomous_decision": autonomous_decision,
             "scan_results": scan_results,
             "ai_strategy": ai_strategy,
             "ai_scan_summary": ai_scan_summary,
@@ -10729,6 +11595,7 @@ def intelligent_smart_scan():
             "warnings": planning_warnings,
             "ai_runtime": ai_runtime,
             "ai_summary_runtime": ai_summary_runtime,
+            "operation_report": operation_report,
             "timestamp": datetime.now().isoformat()
         })
 

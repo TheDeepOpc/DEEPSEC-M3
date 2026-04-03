@@ -91,7 +91,7 @@ function resetStory(target, objective, maxTools, traceId) {
   appendStoryLine("");
   appendStoryLine(`Target: ${target}`);
   appendStoryLine(`Objective: ${objective}`);
-  appendStoryLine(`Max tools: ${maxTools}`);
+  appendStoryLine(`Max tools: ${maxTools > 0 ? maxTools : "AUTO"}`);
   appendStoryLine(`Trace ID: ${traceId}`);
   appendStoryLine("");
   appendStoryLine("AI kuzatuv boshlandi...");
@@ -226,13 +226,70 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
   const warnings = Array.isArray(result.warnings) ? result.warnings : [];
   const commandReplay = Array.isArray(result.command_replay) ? result.command_replay : [];
   const execution = result.scan_results?.execution_summary || {};
+  const autonomy = result.scan_results?.autonomous_decision || result.autonomous_decision || {};
+  const preflight = result.scan_results?.preflight_recon || {};
+  const autonomous = result.scan_results?.ai_autonomous_recon || {};
+  const autonomousCommands = Array.isArray(autonomous.executed_commands) ? autonomous.executed_commands : [];
+  const adaptivePhases = Array.isArray(execution.adaptive_phases) ? execution.adaptive_phases : [];
   const target = result.scan_results?.target || fallbackTarget;
 
   appendStoryLine("");
   appendStoryLine("YAKUNIY HISOBOT");
   appendStoryLine(`Nishon: ${target}`);
+  appendStoryLine(`Rejim: ${autonomy.enabled === false ? "operator-assisted" : "autonomous"}`);
+  appendStoryLine(`AI tanlagan objective: ${autonomy.objective || "auto"}`);
+  appendStoryLine(`AI budget: ${autonomy.tool_budget || execution.tool_budget || "auto"}`);
   appendStoryLine(`Bajarilgan toollar: ${execution.successful_tools || 0}/${execution.total_tools || 0}`);
   appendStoryLine(`Topilgan potensial zaifliklar: ${result.scan_results?.total_vulnerabilities || 0}`);
+
+  if (autonomy.objective_reason) {
+    appendStoryLine(`Objective reason: ${autonomy.objective_reason}`);
+  }
+
+  if (preflight.target_kind || preflight.web_detected !== undefined) {
+    appendStoryLine("");
+    appendStoryLine("AI preflight tahlili:");
+    appendStoryLine(`- target turi: ${preflight.target_kind || "unknown"}`);
+    appendStoryLine(`- web detected: ${preflight.web_detected ? "ha" : "yo'q"}`);
+    if (Array.isArray(preflight.target_hints) && preflight.target_hints.length > 0) {
+      appendStoryLine(`- hintlar: ${preflight.target_hints.join(", ")}`);
+    }
+    if (preflight.http_probe?.status_code) {
+      appendStoryLine(`- status: ${preflight.http_probe.status_code}`);
+    }
+    if (preflight.http_probe?.title) {
+      appendStoryLine(`- title: ${preflight.http_probe.title}`);
+    }
+  }
+
+  if (autonomous.reasoning || autonomousCommands.length > 0) {
+    appendStoryLine("");
+    appendStoryLine("AI avtonom tezkor tekshiruvlari:");
+    if (autonomous.reasoning) {
+      appendStoryLine(`- reason: ${autonomous.reasoning}`);
+    }
+    autonomousCommands.forEach((item, idx) => {
+      appendStoryLine(`${idx + 1}. ${item.step_id || "step"} -> ${item.status || "unknown"}`);
+      appendStoryLine(`   cmd: ${item.command || "n/a"}`);
+      if (item.stdout_excerpt) {
+        appendStoryLine(`   chiqish: ${item.stdout_excerpt}`);
+      }
+      if (item.error || item.stderr_excerpt) {
+        appendStoryLine(`   xato: ${item.error || item.stderr_excerpt}`);
+      }
+    });
+  }
+
+  if (adaptivePhases.length > 0) {
+    appendStoryLine("");
+    appendStoryLine("Adaptiv fazalar:");
+    adaptivePhases.forEach((phase) => {
+      appendStoryLine(`- ${phase.phase || "phase"}: ${(phase.tools || []).join(", ") || "n/a"}`);
+      if (phase.reason) {
+        appendStoryLine(`  reason: ${phase.reason}`);
+      }
+    });
+  }
 
   if (summary.executive_summary) {
     appendStoryLine("");
@@ -273,6 +330,14 @@ function appendFinalSmartScanNarrative(result, fallbackTarget) {
       if (item.error) {
         appendStoryLine(`   sabab: ${item.error}`);
       }
+    });
+  }
+
+  if (typeof result.operation_report === "string" && result.operation_report.trim()) {
+    appendStoryLine("");
+    appendStoryLine("TO'LIQ REPORT:");
+    result.operation_report.split("\n").forEach((line) => {
+      appendStoryLine(line);
     });
   }
 }
@@ -369,8 +434,8 @@ document.getElementById("scan-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   const target = document.getElementById("scan-target").value.trim();
-  const objective = document.getElementById("scan-objective").value;
-  const maxTools = Number(document.getElementById("scan-max-tools").value || 5);
+  const objective = "AI AUTO";
+  const maxTools = 0;
 
   if (!target) return;
 
@@ -381,7 +446,7 @@ document.getElementById("scan-form").addEventListener("submit", (event) => {
     try {
       const result = await apiPost("/api/intelligence/smart-scan", {
         target,
-        objective,
+        autonomous_mode: true,
         max_tools: maxTools,
         trace_id: traceId,
       });
